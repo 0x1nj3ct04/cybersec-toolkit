@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # shellcheck disable=SC1090  # Dynamic source paths are intentional (modular architecture)
 # CyberSec Tools — Verification Script (Modular)
 # Sources all modules and checks installation status of all tools.
@@ -32,8 +32,9 @@ Options:
   --summary          Show only summary counts (no per-tool output)
   -v, --verbose      Enable debug logging and system environment dump
   -h, --help         Show this help and exit
+  --version          Show the toolkit version and exit
 
-Modules: $(IFS=', '; echo "${ALL_MODULES[*]}")
+Modules: $(_m="${ALL_MODULES[*]}"; echo "${_m// /, }")
 EOF
     exit 0
 fi
@@ -52,7 +53,8 @@ while [[ $# -gt 0 ]]; do
         --summary) SUMMARY_ONLY=true; shift ;;
         -v|--verbose) VERBOSE=true; shift ;;
         -h|--help) exec "$0" --help ;;
-        *)         log_error "Unknown option: $1"; exit 1 ;;
+        --version) echo "cybersec-toolkit ${INSTALLER_VERSION:-unknown}"; exit 0 ;;
+        *)         log_error "Unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
 done
 
@@ -67,8 +69,17 @@ fi
 
 # --installed-only: load tracked tools from .versions file
 _INSTALLED_TOOLS=""
+_versions_file="$SCRIPT_DIR/.versions"
+# A present-but-unreadable record (root-owned after `sudo ./install.sh`) would
+# otherwise read as empty: --installed-only would verify nothing and report success.
+if [[ -f "$_versions_file" && ! -r "$_versions_file" ]]; then
+    if [[ "$INSTALLED_ONLY" == "true" ]]; then
+        log_error "Cannot read $_versions_file — re-run with sudo (or make it readable: chmod 644)"
+        exit 1
+    fi
+    log_warn "Cannot read $_versions_file — opt-in Docker images will not be checked (re-run with sudo)"
+fi
 if [[ "$INSTALLED_ONLY" == "true" ]]; then
-    _versions_file="$SCRIPT_DIR/.versions"
     if [[ -f "$_versions_file" ]]; then
         _INSTALLED_TOOLS=$(awk -F'|' '!/^#/{print $1}' "$_versions_file")
         log_info "Filtering by ${_versions_file} ($(echo "$_INSTALLED_TOOLS" | wc -l) tracked tools)"
@@ -261,8 +272,22 @@ check_cmd_any() {
 check_build() {
     local name="$1"
     local dir="$GITHUB_TOOL_DIR/$name"
+    if [[ "$PKG_MANAGER" == pkg && ! -d "$dir" ]] \
+        && ! command_exists "$name"; then
+        return 0
+    fi
     _is_tracked "$name" || return 0
     TOTAL_CHECKED=$((TOTAL_CHECKED + 1))
+
+    local relative binary
+    while IFS='|' read -r relative binary; do
+        [[ -n "$relative" ]] || continue
+        if ! command_exists "$binary" && [[ ! -x "$dir/$relative" ]]; then
+            TOTAL_MISSING=$((TOTAL_MISSING + 1))
+            vlog_error "$name — required executable $binary NOT found"
+            return 1
+        fi
+    done < <(_source_build_bins "$name")
 
     if command_exists "$name"; then
         # Binary is in PATH (e.g. symlinked or installed to /usr/local/bin)
@@ -339,12 +364,53 @@ check_binary_array() {
     local -n _cba_arr="$_arr_name"
     for _entry in "${_cba_arr[@]}"; do
         IFS='|' read -r _ _bin _ <<< "$_entry"
+        _binary_platform_supported "$_bin" || continue
         check_cmd "$_bin" || true
     done
 }
 
 # Batch check helpers
 check_cmds()      { for t in "$@"; do check_cmd "$t" || true; done; }
+check_package_binary() {
+    local package="$1"; shift
+    local -a package_candidates=("$package")
+    fixup_package_names package_candidates
+    [[ ${#package_candidates[@]} -gt 0 ]] || return 0
+    local alias label="$package"
+    local -a aliases=("$package") parts=()
+    for alias in "${_COMPAT_DNF[$package]:-}" "${_COMPAT_PACMAN[$package]:-}" \
+        "${_COMPAT_ZYPPER[$package]:-}" "${_COMPAT_PKG[$package]:-}"; do
+        [[ -n "$alias" && "$alias" != - ]] || continue
+        IFS='+' read -r -a parts <<< "$alias"
+        aliases+=("${parts[@]}")
+    done
+    if [[ "$INSTALLED_ONLY" == true ]]; then
+        label=""
+        for alias in "${aliases[@]}"; do
+            if _is_tracked "$alias"; then
+                label="$alias"
+                break
+            fi
+        done
+        [[ -n "$label" ]] || return 0
+    fi
+    check_cmd_any "$label" "$@"
+}
+check_declared_package_binaries() {
+    local module prefix map_name package
+    local -a commands=()
+    for module in "${VERIFY_MODULES[@]}"; do
+        prefix=$(_module_prefix "$module")
+        map_name="${prefix}_PACKAGE_BIN_NAMES"
+        declare -p "$map_name" &>/dev/null || continue
+        local -n binaries="$map_name"
+        log_info "$module (declared package commands):"
+        for package in "${!binaries[@]}"; do
+            read -r -a commands <<< "${binaries[$package]}"
+            check_package_binary "$package" "${commands[@]}" || true
+        done
+    done
+}
 check_pipx_arr()  { for t in "$@"; do check_pipx "$t" || true; done; }
 check_git_repos() { for n in "$@"; do check_dir "$n" "$GITHUB_TOOL_DIR/$n" || true; done; }
 check_npm_arr()   { for t in "$@"; do check_npm "$t" || true; done; }
@@ -353,7 +419,7 @@ check_npm_arr()   { for t in "$@"; do check_npm "$t" || true; done; }
 should_verify() { [[ " ${VERIFY_MODULES[*]} " =~ " $1 " ]]; }
 
 # System info
-print_banner
+[[ "$SUMMARY_ONLY" == "false" ]] && print_banner
 START_TIME=$(date +%s)
 
 if [[ "$PKG_MANAGER" == "unknown" ]]; then
@@ -361,11 +427,14 @@ if [[ "$PKG_MANAGER" == "unknown" ]]; then
 fi
 
 _setup_verbose
-log_info "System Information:"
-log_info "  OS: $(uname -a)"
-log_info "  Kernel: $(uname -r)"
-log_info "  Arch: $(uname -m)"
-echo ""
+if [[ "$SUMMARY_ONLY" == "false" ]]; then
+    # uname -srm, not -a: -a includes the hostname, and this output is often pasted into issues.
+    log_info "System Information:"
+    log_info "  OS: $(uname -srm)"
+    log_info "  Kernel: $(uname -r)"
+    log_info "  Arch: $(uname -m)"
+    echo ""
+fi
 
 # Runtime environments
 log_info "Environments:"
@@ -685,6 +754,10 @@ if should_verify "blueteam"; then
     fi
     log_info "Blue Team (pipx):"
     check_pipx_arr "${BLUETEAM_PIPX[@]}"
+    log_info "Blue Team (Go):"
+    check_cmds "${BLUETEAM_GO_BINS[@]}"
+    log_info "Blue Team (source builds):"
+    check_builds "${BLUETEAM_BUILD_NAMES[@]}"
     # BLUETEAM_CARGO (yara-x-cli installs binary as 'yr') — see _CARGO_BIN_NAMES
     check_module_cargo "blueteam"
     log_info "Blue Team (Git):"
@@ -737,13 +810,19 @@ if should_verify "llm"; then
     check_cmd "promptfoo" "promptfoo --version" || true
 fi
 
-# Docker images (all modules — uses centralized registry)
+check_declared_package_binaries
+
+# Docker images (all modules — uses centralized registry). They are opt-in
+# (--enable-docker or a Docker profile), so only an image this toolkit recorded
+# as installed is expected; an untracked one is not reported missing.
 if command_exists docker; then
+    _docker_tracked=""
+    [[ -r "$_versions_file" ]] && _docker_tracked=$(awk -F'|' '!/^#/{print $1}' "$_versions_file")
     echo ""
     log_info "━━━━━ Docker Images ━━━━━"
     for _docker_entry in "${ALL_DOCKER_IMAGES[@]}"; do
         IFS='|' read -r _docker_img _docker_label <<< "$_docker_entry"
-        _is_tracked "$_docker_label" || continue
+        grep -qxF "$_docker_label" <<< "$_docker_tracked" || continue
         TOTAL_CHECKED=$((TOTAL_CHECKED + 1))
         if docker images "${_docker_img%%:*}" -q 2>/dev/null | grep -q .; then
             TOTAL_FOUND=$((TOTAL_FOUND + 1))

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # shellcheck disable=SC1090  # Dynamic source paths are intentional (modular architecture)
 # CyberSec Tools — Removal Script (Modular)
 # Sources all modules and removes all installed tools across all methods.
@@ -32,16 +32,18 @@ Options:
                        build-essential, etc.) — DANGEROUS, may break system
   --deep-clean       Remove all caches, module caches, build artifacts, and
                        stale symlinks (Go cache, Cargo registry, pip/pipx
-                       cache, npm cache, rustup toolchains, log files)
-  --yes              Skip confirmation prompt
+                       cache, npm cache, rustup toolchains, log files).
+                       Full removal only; not combinable with --module.
+  -y, --yes          Skip confirmation prompt (required when not on a terminal)
   --force-unrecorded Remove listed tools even when no .versions install record
                        is present — treats every known tool as the toolkit's.
                        DANGEROUS on distros that ship these tools (e.g. Kali,
                        Parrot): it can uninstall your system's own nmap/john/etc.
   -v, --verbose      Enable debug logging and system environment dump
   -h, --help         Show this help and exit
+  --version          Show the toolkit version and exit
 
-Modules: $(IFS=', '; echo "${ALL_MODULES[*]}")
+Modules: $(_m="${ALL_MODULES[*]}"; echo "${_m// /, }")
 
 By default, base dependencies are preserved.  Use --remove-deps explicitly
 to include them in the removal (not recommended on production systems); it
@@ -68,11 +70,12 @@ while [[ $# -gt 0 ]]; do
                              REMOVE_MODULES+=("$2"); shift 2 ;;
         --remove-deps)       REMOVE_DEPS=true; shift ;;
         --deep-clean)        DEEP_CLEAN=true; shift ;;
-        --yes)               AUTO_YES=true; shift ;;
+        -y|--yes)            AUTO_YES=true; shift ;;
         --force-unrecorded)  FORCE_UNRECORDED=true; shift ;;
         -v|--verbose)        VERBOSE=true; shift ;;
         -h|--help)           exec "$0" --help ;;
-        *)                   log_error "Unknown option: $1"; exit 1 ;;
+        --version) echo "cybersec-toolkit ${INSTALLER_VERSION:-unknown}"; exit 0 ;;
+        *)                   log_error "Unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
 done
 
@@ -91,11 +94,18 @@ if [[ ${#REMOVE_MODULES[@]} -eq 0 ]]; then
 else
     # Validate each --module argument is a known module (prevent path traversal / typos)
     _validate_module_names "use --help to see available modules" "${REMOVE_MODULES[@]}"
+    # --deep-clean purges every pipx venv and dangling /usr/local/bin link, not just
+    # the selected modules', which would break tools the user is keeping.
+    if [[ "$DEEP_CLEAN" == "true" ]]; then
+        log_error "--deep-clean cleans up after a full removal and cannot be combined with --module."
+        exit 1
+    fi
 fi
 
 _init_log_file "$SCRIPT_DIR/tool_removal.log"
 
 check_root
+_acquire_run_lock
 print_banner
 
 # When disk space is critically low, free package cache FIRST so that
@@ -155,6 +165,13 @@ if [[ "$AUTO_YES" == "false" ]]; then
         log_warn "--deep-clean: All caches, build artifacts, and stale files WILL be purged!"
     fi
     echo ""
+    # Without a terminal, read gets EOF and a "cancel" would exit 0, so an unattended
+    # run that forgot --yes would report success while removing nothing. Refuse.
+    if [[ ! -t 0 ]]; then
+        log_error "Refusing to remove tools non-interactively without confirmation."
+        log_error "Re-run with --yes (or -y) to proceed unattended."
+        exit 1
+    fi
     read -rp "Proceed with removal? (y/N) " confirm
     echo ""
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -462,6 +479,16 @@ if [[ ${#GIT_NAMES_TO_REMOVE[@]} -gt 0 ]]; then
     for name in "${GIT_NAMES_TO_REMOVE[@]}"; do
         repo_path="$GITHUB_TOOL_DIR/$name"
         if [[ -d "$repo_path" ]]; then
+            if [[ -n "$(_source_build_bins "$name")" ]]; then
+                if remove_source_build "$name"; then
+                    log_success "Removed source build: $name"
+                    git_removed=$((git_removed + 1))
+                else
+                    log_error "Failed to remove source build: $name"
+                    REMOVAL_FAILURES=$((REMOVAL_FAILURES + 1))
+                fi
+                continue
+            fi
             rm -rf "$repo_path"
             _remove_repo_links "$name" "$repo_path"
             log_success "Removed: $repo_path"
@@ -561,10 +588,25 @@ fi
 _toolkit_installed() { _version_known "$1" && ! _is_preexisting "$1"; }
 
 # Metasploit (snap or system package)
-if should_remove "pwn" && command_exists msfconsole && _toolkit_installed metasploit; then
+if should_remove "pwn" && _toolkit_installed metasploit; then
     log_info "Removing Metasploit..."
-    remove_snap_tool metasploit
-    log_success "Metasploit removed"
+    if remove_snap_tool metasploit; then
+        log_success "Metasploit removed"
+        # Keep source files the operator changed or expanded with other repositories.
+        _msf_list=/etc/apt/sources.list.d/metasploit-framework.list
+        _msf_key=/usr/share/keyrings/metasploit-framework.gpg
+        if [[ -f "$_msf_list" && "$(cat -- "$_msf_list" 2>/dev/null)" == "deb [signed-by=$_msf_key] https://apt.metasploit.com/ xenial main" ]]; then
+            if rm -f "$_msf_list" "$_msf_key"; then
+                log_success "Removed the apt.metasploit.com source and key"
+            else
+                log_warn "Failed to remove the apt.metasploit.com source and key"
+                REMOVAL_FAILURES=$((REMOVAL_FAILURES + 1))
+            fi
+        fi
+    else
+        log_warn "Failed to remove Metasploit — keeping its apt source and key"
+        REMOVAL_FAILURES=$((REMOVAL_FAILURES + 1))
+    fi
 fi
 
 # OWASP ZAP (snap)
@@ -639,16 +681,21 @@ if should_remove "recon"; then
     # uv (installed for theHarvester) is also the MCP server's runtime, so only remove it under --remove-deps, and via _builder_home() (not $HOME, which is /root under sudo) to target the real user's install.
     if [[ "$REMOVE_DEPS" == "true" ]]; then
         _uv_home="$(_builder_home)"
-        _uv_removed=false
-        for _uv_bin in "$_uv_home/.local/bin/uv" "$_uv_home/.local/bin/uvx"; do
-            if [[ -e "$_uv_bin" || -L "$_uv_bin" ]] && rm -f "$_uv_bin" 2>/dev/null; then
-                _uv_removed=true
-            fi
-        done
-        if [[ -d "$_uv_home/.local/share/uv" ]] && rm -rf "$_uv_home/.local/share/uv" 2>/dev/null; then
-            _uv_removed=true
+        _uv_marker="$_uv_home/.local/state/cybersec-toolkit/uv-installed"
+        # Only a uv that ensure_uv installed (marker), and only its binaries:
+        # ~/.local/share/uv holds the user's own uv-managed Pythons and tools.
+        if [[ -f "$_uv_marker" ]]; then
+            _uv_removed=false
+            for _uv_bin in "$_uv_home/.local/bin/uv" "$_uv_home/.local/bin/uvx"; do
+                if [[ -e "$_uv_bin" || -L "$_uv_bin" ]] && rm -f "$_uv_bin" 2>/dev/null; then
+                    _uv_removed=true
+                fi
+            done
+            rm -f "$_uv_marker" 2>/dev/null || true
+            [[ "$_uv_removed" == "true" ]] && log_success "Removed uv (kept ~/.local/share/uv)"
+        elif [[ -e "$_uv_home/.local/bin/uv" ]]; then
+            log_info "Keeping uv — not installed by this toolkit"
         fi
-        [[ "$_uv_removed" == "true" ]] && log_success "Removed uv"
     fi
 fi
 
@@ -683,9 +730,13 @@ fi
 # installs one; $PREFIX/lib/go there belongs to the golang package.
 if [[ "$REMOVE_DEPS" == "true" ]] && [[ "$PKG_MANAGER" != "pkg" ]]; then
     _go_root="/usr/local/go"
-    if [[ -d "$_go_root" ]]; then
+    # Only an SDK ensure_go installed carries the marker; a Go you installed by
+    # hand in the same place is left alone.
+    if [[ -d "$_go_root" && ! -L "$_go_root" && -f "$_go_root/.cybersec-toolkit-installed" ]]; then
         rm -rf "$_go_root"
         log_success "Removed Go SDK from $_go_root"
+    elif [[ -d "$_go_root" ]]; then
+        log_info "Keeping $_go_root — not installed by this toolkit"
     fi
 fi
 echo ""
@@ -731,6 +782,9 @@ if [[ "$DEEP_CLEAN" == "true" ]]; then
     log_info "Deep clean: purging caches and build artifacts..."
     _deep_freed=0
     _user_home="$(_builder_home)"
+    # Paths under the user's home are deleted as that user: a symlinked parent
+    # (e.g. ~/.cargo -> /etc) must not redirect root's rm -rf outside their files.
+    _rm_user_tree() { _as_builder "rm -rf -- '$(_escape_single_quoted "$1")'" 2>/dev/null; }
 
     # Go caches
     # Go module cache (downloaded module source)
@@ -744,7 +798,7 @@ if [[ "$DEEP_CLEAN" == "true" ]]; then
     _go_cache="${_user_home}/.cache/go-build"
     if [[ -d "$_go_cache" ]]; then
         _sz=$(du -sm "$_go_cache" 2>/dev/null | cut -f1 || echo 0)
-        rm -rf "$_go_cache"
+        _rm_user_tree "$_go_cache"
         log_success "Removed Go build cache ($_go_cache — ${_sz}MB)"
         _deep_freed=$((_deep_freed + _sz))
     fi
@@ -760,21 +814,21 @@ if [[ "$DEEP_CLEAN" == "true" ]]; then
     # Cargo registry (crate source downloads)
     if [[ -d "$_user_home/.cargo/registry" ]]; then
         _sz=$(du -sm "$_user_home/.cargo/registry" 2>/dev/null | cut -f1 || echo 0)
-        rm -rf "$_user_home/.cargo/registry"
+        _rm_user_tree "$_user_home/.cargo/registry"
         log_success "Removed Cargo registry cache (~/.cargo/registry — ${_sz}MB)"
         _deep_freed=$((_deep_freed + _sz))
     fi
     # Cargo git checkouts
     if [[ -d "$_user_home/.cargo/git" ]]; then
         _sz=$(du -sm "$_user_home/.cargo/git" 2>/dev/null | cut -f1 || echo 0)
-        rm -rf "$_user_home/.cargo/git"
+        _rm_user_tree "$_user_home/.cargo/git"
         log_success "Removed Cargo git cache (~/.cargo/git — ${_sz}MB)"
         _deep_freed=$((_deep_freed + _sz))
     fi
     # Rustup toolchains (only with --remove-deps — these are runtimes)
     if [[ "$REMOVE_DEPS" == "true" ]] && [[ -d "$_user_home/.rustup" ]]; then
         _sz=$(du -sm "$_user_home/.rustup" 2>/dev/null | cut -f1 || echo 0)
-        rm -rf "$_user_home/.rustup"
+        _rm_user_tree "$_user_home/.rustup"
         log_success "Removed Rustup toolchains (~/.rustup — ${_sz}MB)"
         _deep_freed=$((_deep_freed + _sz))
     fi
@@ -784,9 +838,9 @@ if [[ "$DEEP_CLEAN" == "true" ]]; then
         _cargo_bins=$(find "$_user_home/.cargo/bin" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
         if [[ "$_cargo_bins" -eq 0 ]]; then
             rmdir "$_user_home/.cargo/bin" 2>/dev/null || true
-            rm -rf "$_user_home/.cargo/.crates.toml" "$_user_home/.cargo/.crates2.json" \
-                "$_user_home/.cargo/.package-cache" "$_user_home/.cargo/.package-cache-mutate" \
-                "$_user_home/.cargo/.global-cache" 2>/dev/null || true
+            for _cargo_meta in .crates.toml .crates2.json .package-cache .package-cache-mutate .global-cache; do
+                _rm_user_tree "$_user_home/.cargo/$_cargo_meta" || true
+            done
             rmdir "$_user_home/.cargo" 2>/dev/null && log_success "Removed empty ~/.cargo"
         fi
     fi
@@ -872,6 +926,7 @@ if [[ "$DEEP_CLEAN" == "true" ]]; then
 
     # Log files
     for _logfile in "$SCRIPT_DIR/cybersec_install.log" \
+                    "$SCRIPT_DIR/cybersec_rollback.log" \
                     "$SCRIPT_DIR/tool_verification.log" \
                     "$SCRIPT_DIR/tool_update.log" \
                     "$SCRIPT_DIR/tool_removal.log"; do

@@ -181,6 +181,8 @@ setup() {
 @test "pkg_update retries zypper refresh after cleaning stale metadata" {
     source_libs opensuse-tumbleweed zypper
     make_test_tmpdir
+    # Throwaway-container mode: the key auto-import flag is expected here.
+    export CI=true
     export ZYPPER_REFRESH_DELAY=0
     export CALLS_FILE="$TEST_TMPDIR/zypper.calls"
     export REFRESH_COUNT_FILE="$TEST_TMPDIR/zypper.refresh.count"
@@ -214,6 +216,7 @@ setup() {
 @test "pkg_update fails zypper refresh after configured retries are exhausted" {
     source_libs opensuse-tumbleweed zypper
     make_test_tmpdir
+    export CI=true
     export ZYPPER_REFRESH_ATTEMPTS=2
     export ZYPPER_REFRESH_DELAY=0
     export CALLS_FILE="$TEST_TMPDIR/zypper.calls"
@@ -609,4 +612,174 @@ _bc_setup() {
     PATH="/usr/bin:/home/u/.local/bin"
     _path_append /home/u/.cargo/bin /home/u/.local/bin /home/u/.cargo/bin
     [[ "$PATH" == "/usr/bin:/home/u/.local/bin:/home/u/.cargo/bin" ]]
+}
+
+# Dead = gone, or a zombie awaiting reap by its parent.
+_pid_dead() {
+    local line
+    read -r line < "/proc/$1/stat" 2>/dev/null || return 0
+    line="${line##*) }"
+    [[ "${line%% *}" == [ZX] ]]
+}
+
+@test "_kill_tree stops descendants that ignore SIGINT (Ctrl+C orphan case)" {
+    [[ -d /proc/self ]] || skip "needs /proc"
+    source_libs debian apt
+    # Like Stage 3: a background parent whose own background children ignore SIGINT.
+    bash -c 'trap "" INT; sleep 30 & sleep 30 & wait' &
+    local parent=$!
+    local kids="" i
+    for i in $(seq 1 30); do
+        kids=$(_child_pids "$parent")
+        [[ $(wc -w <<<"$kids") -ge 2 ]] && break
+        sleep 0.1
+    done
+    [[ $(wc -w <<<"$kids") -ge 2 ]]
+
+    _kill_tree "$parent" TERM
+    kill -TERM "$parent" 2>/dev/null || true
+
+    local k alive
+    for i in $(seq 1 30); do
+        alive=0
+        for k in $kids; do _pid_dead "$k" || alive=1; done
+        [[ $alive -eq 0 ]] && break
+        sleep 0.1
+    done
+    wait "$parent" 2>/dev/null || true
+    [[ $alive -eq 0 ]]
+}
+
+@test "run lock preserves the caller's stderr" {
+    bats_require_minimum_version 1.5.0
+    command -v flock >/dev/null || skip "needs flock"
+    make_test_tmpdir
+    run --separate-stderr bash -c '
+        source "$1/lib/common.sh"
+        SCRIPT_DIR="$2"
+        _acquire_run_lock
+        printf "visible stdout\n"
+        printf "visible stderr\n" >&2
+    ' fixture "$PROJECT_ROOT" "$TEST_TMPDIR"
+    assert_success
+    assert_output "visible stdout"
+    [[ "$stderr" == "visible stderr" ]]
+}
+
+@test "interrupt kills TERM-resistant reparented descendants and releases the run lock" {
+    [[ -d /proc/self ]] || skip "needs /proc"
+    command -v flock >/dev/null || skip "needs flock"
+    make_test_tmpdir
+    run python3 - "$PROJECT_ROOT" "$TEST_TMPDIR" <<'PY'
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+root, fixture = map(Path, sys.argv[1:])
+child = fixture / "child.sh"
+parent = fixture / "parent.sh"
+pidfile = fixture / "child.pid"
+ready = fixture / "ready"
+child.write_text('trap "" TERM\nprintf "%s\\n" "$$" > "$1"\nexec sleep 90\n')
+parent.write_text('bash "$1" "$2" &\nwait\n')
+body = '''
+source "$1/lib/common.sh"
+SCRIPT_DIR="$2"
+_acquire_run_lock
+bash "$3" "$4" "$5" &
+for i in {1..100}; do [[ -s "$5" ]] && break; sleep 0.01; done
+trap '_stop_job_tree; exit 130' TERM
+: > "$6"
+wait
+'''
+process = subprocess.Popen(
+    ["bash", "-c", body, "fixture", str(root), str(fixture), str(parent), str(child), str(pidfile), str(ready)],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    start_new_session=True,
+)
+pid = None
+try:
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists(), "fixture did not become ready"
+    pid = int(pidfile.read_text())
+    process.send_signal(signal.SIGTERM)
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 130, (process.returncode, stdout, stderr)
+    stat = Path(f"/proc/{pid}/stat")
+    assert not stat.exists() or stat.read_text().rsplit(") ", 1)[1].split()[0] in {"Z", "X"}
+    retry = subprocess.run(
+        ["bash", "-c", 'source "$1/lib/common.sh"; SCRIPT_DIR="$2"; _acquire_run_lock',
+         "fixture", str(root), str(fixture)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert retry.returncode == 0, (retry.stdout, retry.stderr)
+finally:
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.communicate(timeout=5)
+PY
+    assert_success
+}
+
+@test "saved job identity does not signal a different process start time" {
+    [[ -d /proc/self ]] || skip "needs /proc"
+    sleep 30 &
+    local pid=$! start
+    start=$(_process_start_time "$pid")
+    _signal_job "$pid" "$((start + 1))" KILL
+    local alive=0
+    kill -0 "$pid" 2>/dev/null && alive=1
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    [[ "$alive" -eq 1 ]]
+}
+
+@test "lazy package index refreshes once, only on the first install (CL-6)" {
+    source_libs archlinux pacman
+    make_test_tmpdir
+    pkg_update() { echo refresh >> "$TEST_TMPDIR/calls"; }
+    maybe_sudo() { echo "install $*" >> "$TEST_TMPDIR/calls"; }
+
+    # Off by default: other install paths refresh up front themselves.
+    pkg_install foo
+    run grep -c refresh "$TEST_TMPDIR/calls"
+    assert_output "0"
+
+    # --tool path: no refresh until something is installed, then exactly once.
+    : > "$TEST_TMPDIR/calls"
+    _PKG_INDEX_LAZY=true
+    _PKG_INDEX_REFRESHED=false
+    pkg_install foo
+    pkg_install bar
+    run grep -c refresh "$TEST_TMPDIR/calls"
+    assert_output "1"
+}
+
+@test "zypper refresh does not auto-import repo keys outside CI (SI-10)" {
+    source_libs opensuse-tumbleweed zypper
+    make_test_tmpdir
+    unset CI CYBERSEC_ZYPPER_AUTO_IMPORT_KEYS
+    export CALLS_FILE="$TEST_TMPDIR/zypper.calls"
+    maybe_sudo() { printf '%s\n' "$*" >> "$CALLS_FILE"; return 0; }
+
+    run pkg_update
+    assert_success
+    run cat "$CALLS_FILE"
+    assert_output "zypper --non-interactive refresh --force"
 }

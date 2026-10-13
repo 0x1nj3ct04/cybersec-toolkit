@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # shellcheck disable=SC2034  # Arrays are consumed by modules and scripts that source this file
 # installers.sh — Install method helpers for cybersec-toolkit
 # Provides batch install functions for: apt, pipx, go, cargo, gem, git, binary, docker
@@ -79,6 +79,8 @@ fixup_package_names() {
                 qemu-system-x86) continue ;;
             esac
         fi
+
+        _package_distro_excluded "$pkg" && continue
 
         case "$PKG_MANAGER" in
             apt)
@@ -404,6 +406,11 @@ install_ctf_venv() {
     local venv_provenance="latest"
     [[ "$(_tree_provenance "ctf-${name}-venv" "$venv_dir")" == "existing" ]] && venv_provenance="existing"
 
+    if [[ -L "$venvs_dir" ]]; then
+        log_error "Refusing a symlinked venv directory: $venvs_dir"
+        TOTAL_TOOL_FAILURES=$((TOTAL_TOOL_FAILURES + 1))
+        return 1
+    fi
     if ! mkdir -p "$venvs_dir" 2>/dev/null; then
         log_error "Cannot create venv directory: $venvs_dir"
         TOTAL_TOOL_FAILURES=$((TOTAL_TOOL_FAILURES + 1))
@@ -829,9 +836,11 @@ setup_git_repo() {
                 [[ "$_fallback_ok" == "true" ]] && break
             done
             # Last resort: relax pinned versions (== → >=) and retry with system Python.
-            # Only triggers when strict pins exist and all older-Python fallbacks failed.
-            if [[ "$_fallback_ok" != "true" ]] && grep -qE '^[^#].*==' "$dest/requirements.txt" 2>/dev/null; then
-                log_info "Retrying $name with relaxed version pins (== → >=)..."
+            # Only triggers when strict pins exist and all older-Python fallbacks failed,
+            # and never in strict mode, which must not install unpinned versions.
+            if [[ "$_fallback_ok" != "true" ]] && [[ "${REQUIRE_CHECKSUMS:-false}" != "true" ]] \
+                && grep -qE '^[^#].*==' "$dest/requirements.txt" 2>/dev/null; then
+                log_warn "Retrying $name with relaxed version pins (== → >=): newer, unpinned dependency versions"
                 rm -rf "$dest/venv"
                 if _as_builder "python3 -m venv '$_dest_esc/venv'" 2>>"$LOG_FILE"; then
                     _as_builder "'$_dest_esc/venv/bin/pip' install -q --upgrade pip" >> "$LOG_FILE" 2>&1 || true
@@ -1270,10 +1279,40 @@ _gh_api_get() {
 # Verify download against release checksum file
 # Looks for SHA256 checksum files in the same GitHub release and verifies
 # the downloaded file.  Returns 0 on match, 1 on mismatch or missing checksums.
+_verify_release_metadata_checksum() {
+    local release_json="$1" file_path="$2" file_name="$3" repo="${4:-}"
+    local expected_hash tag
+    expected_hash=$(echo "$release_json" | python3 -c '
+import json, re, sys
+data = json.load(sys.stdin)
+assets = [a for a in data.get("assets", []) if a.get("name") == sys.argv[1]]
+if len(assets) != 1:
+    raise SystemExit(1)
+digest = assets[0].get("digest") or ""
+if isinstance(digest, str) and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+    print(digest[7:].lower())
+' "$file_name" 2>>"$LOG_FILE") || return 1
+    if [[ -z "$expected_hash" && -n "$repo" && -f "$SCRIPT_DIR/lib/release_checksums.tsv" ]]; then
+        tag=$(echo "$release_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name", ""))' 2>>"$LOG_FILE")
+        expected_hash=$(awk -F '\t' -v r="$repo" -v t="$tag" -v a="$file_name" \
+            '$1 == r && $2 == t && $3 == a {print $4; exit}' "$SCRIPT_DIR/lib/release_checksums.tsv")
+    fi
+    [[ "$expected_hash" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    local actual_hash
+    actual_hash=$(sha256sum "$file_path" | awk '{print $1}')
+    if [[ "$actual_hash" != "${expected_hash,,}" ]]; then
+        log_error "Checksum MISMATCH for $file_name"
+        touch "$(dirname "$file_path")/.checksum_mismatch"
+        return 1
+    fi
+    log_success "Checksum verified: $file_name (release digest or reviewed checksum)"
+}
+
 verify_github_checksum() {
     local release_json="$1"
     local file_path="$2"
     local file_name="$3"
+    local repo="${4:-}"
 
     # Look for a checksum asset in the release. Prefer a per-file "<file>.sha256",
     # then a shared checksums file; skip signatures (.sig/.asc/.pem/.pub/.cert),
@@ -1299,6 +1338,10 @@ print(per_file or shared or '')
 " 2>>"$LOG_FILE")
 
     if [[ -z "$checksum_url" ]]; then
+        if _verify_release_metadata_checksum "$release_json" "$file_path" "$file_name" "$repo"; then
+            return 0
+        fi
+        [[ -f "$(dirname "$file_path")/.checksum_mismatch" ]] && return 1
         log_warn "No checksum file in release for $file_name — skipping verification"
         return 1
     fi
@@ -1326,6 +1369,10 @@ print(per_file or shared or '')
         fi
     fi
     if [[ -z "$checksums" ]]; then
+        if _verify_release_metadata_checksum "$release_json" "$file_path" "$file_name" "$repo"; then
+            return 0
+        fi
+        [[ -f "$(dirname "$file_path")/.checksum_mismatch" ]] && return 1
         log_warn "Failed to download checksums for $file_name"
         return 1
     fi
@@ -1342,6 +1389,10 @@ print(per_file or shared or '')
             END {if (lines==1 && hits==1) print h}')
     fi
     if [[ -z "$expected_hash" ]]; then
+        if _verify_release_metadata_checksum "$release_json" "$file_path" "$file_name" "$repo"; then
+            return 0
+        fi
+        [[ -f "$(dirname "$file_path")/.checksum_mismatch" ]] && return 1
         log_warn "No checksum entry for $file_name in checksums file"
         return 1
     fi
@@ -1414,9 +1465,79 @@ except (OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
 PY
 }
 
-# Internal implementation for downloading GitHub release binaries.
-# Used by both download_github_release() and download_github_release_update().
-# Args: repo binary pattern dest_dir mode [archive_binary]
+_module_tool_metadata() {
+    local tool="$1" suffix="$2" metadata_name
+    while IFS= read -r metadata_name; do
+        [[ "$metadata_name" == *"_$suffix" ]] || continue
+        local -n metadata="$metadata_name"
+        if [[ -n "${metadata[$tool]:-}" ]]; then
+            printf '%s\n' "${metadata[$tool]}"
+            return 0
+        fi
+    done < <(compgen -A variable)
+    return 0
+}
+
+_package_distro_excluded() {
+    local exclusions inclusions distro
+    exclusions=$(_module_tool_metadata "$1" PACKAGE_EXCLUSIONS)
+    [[ -n "$exclusions" ]] || return 1
+    inclusions=$(_module_tool_metadata "$1" PACKAGE_INCLUSIONS)
+    [[ " $inclusions " == *" $DISTRO_ID "* ]] && return 1
+    for distro in "$DISTRO_ID" ${DISTRO_ID_LIKE:-}; do
+        [[ " $exclusions " == *" $distro "* ]] && return 0
+    done
+    return 1
+}
+
+_binary_platform_supported() {
+    local architectures
+    architectures=$(_module_tool_metadata "$1" BINARY_ARCHITECTURES)
+    [[ -n "$architectures" ]] || return 0
+    [[ "$PKG_MANAGER" != pkg && " $architectures " == *" $SYS_ARCH "* ]]
+}
+
+_prepare_binary_runtime() {
+    local tool="$1" content_root="$2" executable="$3" release_tag="$4"
+    local configuration releases dependencies
+    configuration=$(_module_tool_metadata "$tool" BINARY_RUNTIME_CONFIGS)
+    [[ -n "$configuration" ]] || return 0
+    releases=$(_module_tool_metadata "$tool" BINARY_RUNTIME_RELEASES)
+    if [[ -n "$releases" && " $releases " != *" $release_tag "* ]]; then
+        log_error "$tool $release_tag needs a reviewed runtime configuration; supported releases: $releases"
+        return 1
+    fi
+    dependencies=$(_module_tool_metadata "$tool" BINARY_DEPENDENCIES)
+    local dependency_repo dependency_binary dependency_pattern dependency_directory dependency_tag
+    # Runtime dependencies stay private and verified even when the outer install uses --fast.
+    local REQUIRE_CHECKSUMS=true FAST_MODE=false
+    while IFS='|' read -r dependency_repo dependency_binary dependency_pattern dependency_directory dependency_tag; do
+        [[ -n "$dependency_repo" ]] || continue
+        if [[ -z "$dependency_tag" || "$dependency_directory" == /* || "/$dependency_directory/" == */../* ]]; then
+            log_error "Invalid runtime dependency configuration for $tool"
+            return 1
+        fi
+        (
+            local PIPX_BIN_DIR="$content_root/$dependency_directory"
+            _download_github_release_impl "$dependency_repo" "$dependency_binary" "$dependency_pattern" \
+                "$PIPX_BIN_DIR" dependency "$dependency_binary" "$dependency_tag"
+        ) || return 1
+    done <<< "$dependencies"
+    if ! printf '%s\n' "$configuration" | python3 -c '
+import json, sys
+from pathlib import Path
+configuration = json.load(sys.stdin)
+configuration["executable"] = str(Path(sys.argv[2]).relative_to(sys.argv[1]))
+Path(sys.argv[1], ".runtime-launcher.json").write_text(json.dumps(configuration) + "\n")
+' "$content_root" "$executable"; then
+        log_error "Invalid runtime launcher configuration for $tool"
+        return 1
+    fi
+    cp "$SCRIPT_DIR/lib/runtime_launcher.py" "$content_root/runtime_launcher.py" || return 1
+    chmod 755 "$content_root/runtime_launcher.py"
+}
+
+# Args: repo binary pattern dest_dir mode [archive_binary] [release_tag]
 #   mode=install: skip if already installed, track version, log success/failure
 #   mode=update:  force re-download, set _RELEASE_TAG, no version tracking (caller does it)
 _download_github_release_impl() {
@@ -1426,6 +1547,30 @@ _download_github_release_impl() {
     local dest_dir="${4:-$PIPX_BIN_DIR}"
     local mode="${5:-install}"  # "install" or "update"
     local archive_binary="${6:-$binary}"
+    local requested_tag="${7:-}"
+
+    if ! _binary_platform_supported "$binary"; then
+        log_warn "Skipping $binary — no supported release for this platform"
+        return 0
+    fi
+    if [[ "$(_module_tool_metadata "$binary" BINARY_EXCLUSIVE_DIRS)" == true ]]; then
+        local exposed_binary="$PIPX_BIN_DIR/$binary"
+        if [[ -e "$exposed_binary" || -L "$exposed_binary" ]]; then
+            if [[ ! -L "$exposed_binary" || "$(readlink "$exposed_binary")" != "$dest_dir/"* ]] \
+                || ! _version_known "$binary" || _is_preexisting "$binary"; then
+                log_error "Preserving existing executable: $exposed_binary"
+                return 1
+            fi
+        fi
+        if [[ -L "$dest_dir" || ( -e "$dest_dir" && ! -d "$dest_dir" ) ]]; then
+            log_error "Preserving existing destination: $dest_dir"
+            return 1
+        fi
+        if [[ -d "$dest_dir" ]] && { ! _version_known "$binary" || _is_preexisting "$binary"; }; then
+            log_error "Preserving destination not owned by the toolkit: $dest_dir"
+            return 1
+        fi
+    fi
 
     # Ensure unzip is available for .zip archives
     if ! command_exists unzip; then
@@ -1445,9 +1590,10 @@ _download_github_release_impl() {
     log_debug "_download_github_release_impl[$mode]: repo=$repo binary=$binary pattern=$pattern"
     log_info "Downloading $binary from $repo releases..."
     local api_url="https://api.github.com/repos/$repo/releases/latest"
+    [[ -n "$requested_tag" ]] && api_url="https://api.github.com/repos/$repo/releases/tags/$requested_tag"
     local release_json
     release_json=$(_gh_api_get "$api_url")
-    if [[ -z "$release_json" ]]; then
+    if [[ -z "$release_json" && -z "$requested_tag" ]]; then
         # /releases/latest 404s on prerelease-only repos (nightly builds, e.g.
         # fuzzland/ityfuzz) — fall back to the newest release of any kind.
         release_json=$(_gh_api_get "https://api.github.com/repos/$repo/releases" \
@@ -1461,6 +1607,10 @@ _download_github_release_impl() {
     # Extract actual release tag for version tracking
     local release_tag=""
     release_tag=$(echo "$release_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null || true)
+    if [[ -n "$requested_tag" && "$release_tag" != "$requested_tag" ]]; then
+        log_error "Release metadata does not match requested tag $requested_tag"
+        return 1
+    fi
 
     [[ "$mode" == "update" ]] && _RELEASE_TAG="$release_tag"
 
@@ -1502,7 +1652,12 @@ for asset in data.get('assets', []):
     # --fast skips verification entirely (mutually exclusive with --require-checksums)
     local _action_label="install"
     [[ "$mode" == "update" ]] && _action_label="update"
-    if [[ "${FAST_MODE:-false}" != "true" ]] && ! verify_github_checksum "$release_json" "$tmp_dir/$asset_name" "$asset_name"; then
+    # Strict mode always verifies: an inherited FAST_MODE must never turn
+    # --require-checksums/--production into an unverified install (update.sh has
+    # no --fast/strict exclusivity check of its own).
+    local _skip_verify=false
+    [[ "${FAST_MODE:-false}" == "true" && "${REQUIRE_CHECKSUMS:-false}" != "true" ]] && _skip_verify=true
+    if [[ "$_skip_verify" != "true" ]] && ! verify_github_checksum "$release_json" "$tmp_dir/$asset_name" "$asset_name" "$repo"; then
         if [[ -f "$tmp_dir/.checksum_mismatch" ]]; then
             log_error "Aborting $_action_label of $binary due to checksum mismatch"
             rm -rf "$tmp_dir"
@@ -1630,6 +1785,12 @@ WRAPPER
         return 1
     fi
 
+    if ! _prepare_binary_runtime "$binary" "$content_root" "$found" "$release_tag"; then
+        log_error "Failed to prepare runtime for $binary"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
     if [[ "$dest_dir" != "$PIPX_BIN_DIR" ]]; then
         if ! mkdir -p "$dest_dir" "$PIPX_BIN_DIR" \
             || ! cp -a "$content_root"/. "$dest_dir/" >>"$LOG_FILE" 2>&1; then
@@ -1637,8 +1798,11 @@ WRAPPER
             rm -rf "$tmp_dir"
             return 1
         fi
-        # cp -a keeps extracted modes (and unzip restores archive modes); strip setuid/setgid.
+        # cp -a keeps extracted modes (and unzip restores archive modes); strip setuid/setgid
+        # and group/world write, so an upstream zip stored with 0777 cannot leave
+        # installed files that any local user could replace.
         find "$dest_dir" -xdev -type f -perm /6000 -exec chmod a-s {} + 2>>"$LOG_FILE"
+        chmod -R go-w "$dest_dir" 2>>"$LOG_FILE" || true
         local dest_bin=""
         for candidate in \
             "$dest_dir/bin/$binary" \
@@ -1656,6 +1820,10 @@ WRAPPER
         done
         if [[ -z "$dest_bin" ]]; then
             dest_bin=$(find "$dest_dir" \( -name "$archive_binary" -o -name "${archive_binary}.sh" \) -type f 2>/dev/null | head -1)
+        fi
+        if [[ -f "$content_root/.runtime-launcher.json" ]]; then
+            chmod +x "$dest_dir/${found#"$content_root/"}" || return 1
+            dest_bin="$dest_dir/runtime_launcher.py"
         fi
         if [[ -z "$dest_bin" || -L "$dest_bin" ]] \
             || ! chmod +x "$dest_bin" \
@@ -1695,6 +1863,11 @@ download_github_release() {
     local pattern="$3"
     local dest_dir="${4:-$PIPX_BIN_DIR}"
     local archive_binary="${5:-$binary}"
+
+    if ! _binary_platform_supported "$binary"; then
+        log_warn "Skipping $binary — no supported release for this platform"
+        return 0
+    fi
 
     if [[ "${SKIP_BINARY:-false}" == "true" ]]; then
         log_warn "Skipping binary release: $binary (--skip-binary)"
@@ -1820,6 +1993,64 @@ track_version() {
     fi
 }
 
+_source_build_bins() {
+    _module_tool_metadata "$1" BUILD_BINS
+}
+
+_ensure_requested_source_deps() {
+    [[ "$PKG_MANAGER" == pkg ]] && return 0
+    local packages
+    packages=$(_module_tool_metadata "$1" "BUILD_PACKAGES_${PKG_MANAGER^^}")
+    [[ -n "$packages" ]] || packages=$(_module_tool_metadata "$1" BUILD_PACKAGES)
+    [[ -n "$packages" ]] || return 0
+    local -a dependencies=()
+    read -r -a dependencies <<< "$packages"
+    local prior_failures="$TOTAL_TOOL_FAILURES"
+    install_apt_batch "$1 build dependencies" "${dependencies[@]}"
+    [[ "$TOTAL_TOOL_FAILURES" -eq "$prior_failures" ]]
+}
+
+setup_source_build_bins() {
+    local name="$1" relative binary source link
+    local -a sources=() links=()
+    while IFS='|' read -r relative binary; do
+        [[ -n "$relative" ]] || continue
+        source="$GITHUB_TOOL_DIR/$name/$relative"
+        link="$PIPX_BIN_DIR/$binary"
+        if [[ ! -f "$source" || ! -x "$source" || -L "$source" ]]; then
+            log_error "Missing built executable: $source"
+            return 1
+        fi
+        if [[ -e "$link" || -L "$link" ]]; then
+            if [[ ! -L "$link" || "$(readlink "$link")" != "$source" ]]; then
+                log_error "Preserving existing executable: $link"
+                return 1
+            fi
+        fi
+        sources+=("$source")
+        links+=("$link")
+    done < <(_source_build_bins "$name")
+    [[ ${#sources[@]} -gt 0 ]] || return 0
+    mkdir -p "$PIPX_BIN_DIR" || return 1
+    local index
+    for index in "${!sources[@]}"; do
+        ln -sf "${sources[$index]}" "${links[$index]}" || return 1
+    done
+}
+
+_cleanup_failed_source_build() {
+    local name="$1" relative binary source link
+    while IFS='|' read -r relative binary; do
+        [[ -n "$relative" ]] || continue
+        source="$GITHUB_TOOL_DIR/$name/$relative"
+        link="$PIPX_BIN_DIR/$binary"
+        if [[ -L "$link" && "$(readlink "$link")" == "$source" ]]; then
+            rm -f "$link" || return 1
+        fi
+    done < <(_source_build_bins "$name")
+    rm -rf "${GITHUB_TOOL_DIR:?}/$name"
+}
+
 build_from_source() {
     local name="$1"
     local url="$2"
@@ -1837,6 +2068,12 @@ build_from_source() {
         return 0
     fi
 
+    if [[ -L "$dest" || ( -e "$dest" && ! -d "$dest" ) ]]; then
+        log_error "Preserving existing source destination: $dest"
+        TOTAL_TOOL_FAILURES=$((TOTAL_TOOL_FAILURES + 1))
+        return 1
+    fi
+
     # Provenance before we touch it — a tree we did not create stays put on uninstall.
     local is_existing=false
     [[ -d "$dest" ]] && is_existing=true
@@ -1847,10 +2084,12 @@ build_from_source() {
         _stop_spinner
         log_error "Clone failed: $name"
         TOTAL_TOOL_FAILURES=$((TOTAL_TOOL_FAILURES + 1))
+        [[ "$is_existing" == "false" ]] && _cleanup_failed_source_build "$name"
         return 1
     fi
     # Build in a subshell (preserves caller's CWD) via _as_builder (build as user, not root); build_cmd is a trusted *_BUILD_CMDS string passed verbatim to `bash -c` — do NOT quote-escape it, that corrupts its own quotes (e.g. yafu/pemcrack `sed '...'` patches).
-    if (cd "$dest" && _as_builder "$build_cmd") >> "$LOG_FILE" 2>&1; then
+    if (cd "$dest" && _as_builder "$build_cmd") >> "$LOG_FILE" 2>&1 \
+        && setup_source_build_bins "$name" >> "$LOG_FILE" 2>&1; then
         _stop_spinner
         log_success "Built: $name"
         if [[ "$is_existing" == "true" ]]; then
@@ -1864,6 +2103,7 @@ build_from_source() {
         log_error "  Check the log for details: $LOG_FILE"
         log_error "  Use --skip-source to skip all build-from-source tools"
         TOTAL_TOOL_FAILURES=$((TOTAL_TOOL_FAILURES + 1))
+        [[ "$is_existing" == "false" ]] && _cleanup_failed_source_build "$name"
         return 1
     fi
 }
@@ -1932,9 +2172,11 @@ BINARY_RELEASES_FORENSICS=(
     "WithSecureLabs/chainsaw|chainsaw|x86_64.*linux"
     "ufrisk/MemProcFS|memprocfs|linux_${_BINARY_RELEASE_ARCH_X64}-.*\\.tar\\.gz$|${GITHUB_TOOL_DIR}/MemProcFS|memprocfs"
     "WerWolv/ImHex|imhex|imhex-.*-x86_64\\.AppImage$"
+    "nikaiw/VMkatz|vmkatz|vmkatz-.*-linux-${SYS_ARCH_ALT/armv7l/armv7}\\.tar\\.gz$"
 )
 BINARY_RELEASES_ENTERPRISE=(
     "ropnop/kerbrute|kerbrute|linux_amd64"
+    "Flangvik/TeamFiltration|TeamFiltration|TeamFiltration-.*-linux-${SYS_ARCH/amd64/x86_64}\\.zip$|${GITHUB_TOOL_DIR}/TeamFiltration"
 )
 BINARY_RELEASES_BLUETEAM=(
     "Velocidex/velociraptor|velociraptor|linux-amd64$"
@@ -1944,6 +2186,7 @@ BINARY_RELEASES_BLUETEAM=(
     "Neo23x0/Loki-RS|loki|loki-linux-x86_64.*\\.tar\\.gz"
     "Yamato-Security/hayabusa|hayabusa|lin-${_BINARY_RELEASE_ARCH_X64}-gnu\\.zip$|${GITHUB_TOOL_DIR}/hayabusa|hayabusa-*-lin-${_BINARY_RELEASE_ARCH_X64}-gnu"
     "osquery/osquery|osqueryi|linux_x86_64\\.tar\\.gz$"
+    "Yamato-Security/takajo|takajo|takajo-.*-lin-x64-gnu\\.zip$|${GITHUB_TOOL_DIR}/takajo|takajo-*-lin-x64-gnu"
 )
 BINARY_RELEASES_CONTAINERS=(
     "anchore/grype|grype|linux_amd64\\.tar\\.gz"
@@ -2098,6 +2341,23 @@ install_binary_releases() {
         _report_method_total "Binary" 0
         return 0
     fi
+
+    local -a platform_entries=()
+    local platform_entry platform_binary
+    for platform_entry in "${entries[@]}"; do
+        IFS='|' read -r _ platform_binary _ <<< "$platform_entry"
+        if _binary_platform_supported "$platform_binary"; then
+            platform_entries+=("$platform_entry")
+        else
+            log_warn "Skipping $platform_binary — no supported release for this platform"
+        fi
+    done
+    if [[ ${#platform_entries[@]} -eq 0 ]]; then
+        _report_method_total "Binary" 0
+        return 0
+    fi
+    entries=("${platform_entries[@]}")
+    total=${#entries[@]}
 
     # Non-dpkg distros: drop .deb-only entries (e.g. stegseek) before downloading
     # rather than failing on dpkg afterwards.
@@ -2373,8 +2633,20 @@ install_zap() {
 remove_source_build() {
     local name="$1"
     [[ -n "$name" ]] || return 1
+    local entries relative binary link source
+    entries=$(_source_build_bins "$name")
+    if [[ -n "$entries" ]]; then
+        while IFS='|' read -r relative binary; do
+            source="$GITHUB_TOOL_DIR/$name/$relative"
+            link="$PIPX_BIN_DIR/$binary"
+            if [[ -L "$link" && "$(readlink "$link")" == "$source" ]]; then
+                rm -f "$link" || return 1
+            fi
+        done <<< "$entries"
+    else
+        rm -f "$PIPX_BIN_DIR/$name" "$PIPX_BIN_DIR/${name,,}" 2>/dev/null || true
+    fi
     [[ -d "$GITHUB_TOOL_DIR/$name" ]] && rm -rf "${GITHUB_TOOL_DIR:?}/$name"
-    rm -f "$PIPX_BIN_DIR/$name" "$PIPX_BIN_DIR/${name,,}" 2>/dev/null || true
     # Report the post-condition: callers drop the .versions row on success, and a
     # tree that survived must not be recorded as removed.
     [[ ! -e "$GITHUB_TOOL_DIR/$name" ]]
@@ -2411,13 +2683,20 @@ remove_special_tool() {
             for _bin in foundryup forge cast anvil chisel; do
                 [[ -L "$PIPX_BIN_DIR/$_bin" ]] && rm -f "$PIPX_BIN_DIR/$_bin" 2>/dev/null
             done
-            _dir="$(_builder_home)/.foundry"
-            [[ -d "$_dir" ]] && rm -rf "$_dir"
+            # Remove only the toolkit-installed binaries; keep the rest of
+            # ~/.foundry (keystores, config) so uninstall never destroys wallets.
+            _dir="$(_builder_home)/.foundry/bin"
+            [[ -d "$_dir" ]] && rm -rf "${_dir:?}"
             ;;
         steampipe)
             rm -f "$PIPX_BIN_DIR/steampipe" 2>/dev/null || true
-            _dir="$(_builder_home)/.steampipe"
-            [[ -d "$_dir" ]] && rm -rf "$_dir"
+            # Remove the installed binary; keep ~/.steampipe (connection .spc
+            # configs, which can hold credentials) rather than deleting user data.
+            local _cand
+            for _cand in /usr/local/bin/steampipe "$(_builder_home)/.steampipe/steampipe"; do
+                [[ -e "$_cand" || -L "$_cand" ]] && rm -f "$_cand" 2>/dev/null || true
+            done
+            _dir=""
             ;;
         patator)
             rm -f "$PIPX_BIN_DIR/patator" 2>/dev/null || true

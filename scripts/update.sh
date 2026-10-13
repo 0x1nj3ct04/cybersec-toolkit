@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # shellcheck disable=SC1090  # Dynamic source paths are intentional (modular architecture)
 # CyberSec Tools — Update Script (Modular)
 # Sources all modules and updates all installed tools across all methods.
@@ -33,12 +33,14 @@ Options:
   --skip-gems      Skip Ruby gem update
   --skip-cargo     Skip Cargo tool update
   --skip-binary    Skip binary release update
-  --skip-special   Skip Metasploit/ZAP update
+  --skip-special   Skip Metasploit, promptfoo, ZAP, Foundry, the ctf-crypto
+                   venv and Steampipe (updated only when this toolkit installed them)
   --skip-docker    Skip Docker image update
   --require-checksums  Fail if a binary release has no checksum file
   --production     Alias for strict release checksum verification
   -v, --verbose    Enable debug logging and system environment dump
   -h, --help       Show this help and exit
+  --version        Show the toolkit version and exit
 EOF
     exit 0
 fi
@@ -71,7 +73,8 @@ while [[ $# -gt 0 ]]; do
         --production)   PRODUCTION_MODE=true; REQUIRE_CHECKSUMS=true; shift ;;
         -v|--verbose)   VERBOSE=true; shift ;;
         -h|--help)      exec "$0" --help ;;
-        *)              log_error "Unknown option: $1"; exit 1 ;;
+        --version) echo "cybersec-toolkit ${INSTALLER_VERSION:-unknown}"; exit 0 ;;
+        *)              log_error "Unknown option: $1 (see --help)" >&2; exit 2 ;;
     esac
 done
 
@@ -80,6 +83,7 @@ export VERBOSE REQUIRE_CHECKSUMS PRODUCTION_MODE
 _init_log_file "$SCRIPT_DIR/tool_update.log"
 
 check_root
+_acquire_run_lock
 print_banner
 
 _check_pkg_manager
@@ -268,7 +272,9 @@ if [[ "$SKIP_GIT" == "false" ]]; then
 
             pull_output=""
             _dir_escaped="$(_escape_single_quoted "$dir")"
-            if pull_output=$(_as_builder "git $_GIT_STALL_OPTS -C '$_dir_escaped' pull" 2>>"$LOG_FILE"); then
+            # LC_ALL=C: the "Already up to date" check below must not depend on the
+            # user's locale (git translates it, which would mark every repo updated).
+            if pull_output=$(_as_builder "LC_ALL=C git $_GIT_STALL_OPTS -C '$_dir_escaped' pull" 2>>"$LOG_FILE"); then
                 if echo "$pull_output" | grep -q "Already up to date"; then
                     log_debug "Already latest: $name"
                     GIT_SKIPPED=$((GIT_SKIPPED + 1))
@@ -449,6 +455,11 @@ if [[ "$SKIP_BINARY" == "false" ]]; then
         local repo="$1" binary="$2" pattern="$3" dest="${4:-$PIPX_BIN_DIR}"
         local archive_binary="${5:-$binary}"
 
+        if ! _binary_platform_supported "$binary"; then
+            log_debug "Skipping $binary (no supported release for this platform)"
+            return 0
+        fi
+
         # Only refresh releases this toolkit installed: an unrecorded or
         # pre-existing binary on PATH is the user's (e.g. an apt package), so a
         # re-download into $dest (usually /usr/local/bin) would overshadow it.
@@ -552,8 +563,14 @@ echo ""
 if [[ "$SKIP_SPECIAL" == "false" ]]; then
     log_info "Updating special tools..."
 
+    # Update only what this toolkit installed: a copy the user had first (or a
+    # distro package) is theirs to update, and a root-run update could shadow it.
+    _toolkit_owns() { _version_known "$1" && ! _is_preexisting "$1"; }
+
     # Metasploit (snap takes priority, then msfupdate for Rapid7/apt installs)
-    if snap_available && snap list metasploit-framework &>/dev/null 2>&1; then
+    if ! _toolkit_owns metasploit; then
+        :
+    elif snap_available && snap list metasploit-framework &>/dev/null 2>&1; then
         log_info "Updating Metasploit (snap)..."
         if snap refresh metasploit-framework >> "$LOG_FILE" 2>&1; then
             log_success "Metasploit updated"
@@ -571,7 +588,7 @@ if [[ "$SKIP_SPECIAL" == "false" ]]; then
     fi
 
     # npm tools (promptfoo)
-    if command_exists npm && command_exists promptfoo; then
+    if command_exists npm && command_exists promptfoo && _toolkit_owns promptfoo; then
         log_info "Updating promptfoo (npm)..."
         if npm install -g "promptfoo@latest" >> "$LOG_FILE" 2>&1; then
             _pf_ver=$(promptfoo --version 2>/dev/null || echo "latest")
@@ -584,7 +601,7 @@ if [[ "$SKIP_SPECIAL" == "false" ]]; then
     fi
 
     # OWASP ZAP (snap)
-    if command_exists zaproxy && snap_available && snap list zaproxy &>/dev/null; then
+    if command_exists zaproxy && snap_available && snap list zaproxy &>/dev/null && _toolkit_owns zaproxy; then
         log_info "Updating OWASP ZAP..."
         if snap refresh zaproxy >> "$LOG_FILE" 2>&1; then
             log_success "OWASP ZAP updated"
@@ -597,7 +614,7 @@ if [[ "$SKIP_SPECIAL" == "false" ]]; then
     # Foundry (foundryup) — run as the invoking user so the update lands in the
     # user's ~/.foundry (where the /usr/local/bin symlinks point), not /root under sudo.
     _foundryup_bin="$(_builder_home)/.foundry/bin/foundryup"
-    if [[ -x "$_foundryup_bin" ]]; then
+    if [[ -x "$_foundryup_bin" ]] && _toolkit_owns foundry; then
         log_info "Updating Foundry toolchain..."
         if _as_builder "'$(_escape_single_quoted "$_foundryup_bin")'" >> "$LOG_FILE" 2>&1; then
             log_success "Foundry updated"
@@ -610,7 +627,7 @@ if [[ "$SKIP_SPECIAL" == "false" ]]; then
     # ctf-crypto venv (CRYPTO_VENV_LIBS, modules/crypto.sh) — pip is the only
     # thing that knows these are installed; nothing else updates them.
     _crypto_venv="${CYBERSEC_MCP_VENVS_DIR:-$(_builder_home)/.ctf-venvs}/crypto"
-    if [[ -x "$_crypto_venv/bin/pip" ]] && [[ ${#CRYPTO_VENV_LIBS[@]} -gt 0 ]]; then
+    if [[ -x "$_crypto_venv/bin/pip" ]] && [[ ${#CRYPTO_VENV_LIBS[@]} -gt 0 ]] && _toolkit_owns ctf-crypto-venv; then
         log_info "Updating ctf-crypto venv libraries..."
         if _as_builder "'$(_escape_single_quoted "$_crypto_venv")/bin/pip' install -q --upgrade ${CRYPTO_VENV_LIBS[*]}" >> "$LOG_FILE" 2>&1; then
             log_success "ctf-crypto venv updated"
@@ -620,8 +637,13 @@ if [[ "$SKIP_SPECIAL" == "false" ]]; then
         fi
     fi
 
-    # Steampipe (re-install = self-update) — verify script content before executing
-    if command_exists steampipe; then
+    # Steampipe (re-install = self-update) — verify script content before executing.
+    # Strict mode refuses its unsigned install script, as on install.
+    if ! _toolkit_owns steampipe; then
+        :
+    elif command_exists steampipe && [[ "${REQUIRE_CHECKSUMS:-false}" == "true" ]]; then
+        log_warn "Strict mode: skipping Steampipe update — its installer is an unsigned script"
+    elif command_exists steampipe; then
         log_info "Updating Steampipe..."
         _sp_tmp=$(mktemp)
         _register_cleanup "$_sp_tmp"
@@ -651,6 +673,8 @@ if [[ "$SKIP_DOCKER" == "false" ]]; then
         DOCKER_UPDATED=0
         for _docker_entry in "${ALL_DOCKER_IMAGES[@]}"; do
             IFS='|' read -r _docker_img _docker_label <<< "$_docker_entry"
+            # Only images this toolkit pulled; a user's own copy of the same image is theirs.
+            _version_known "$_docker_label" && ! _is_preexisting "$_docker_label" || continue
             if docker images "${_docker_img%%:*}" -q 2>/dev/null | grep -q .; then
                 if docker pull "$_docker_img" >> "$LOG_FILE" 2>&1; then
                     log_success "Updated Docker: $_docker_label"
@@ -703,7 +727,7 @@ for _bmod in "${ALL_MODULES[@]}"; do
         # reapply the idempotent patch before giving up.
         _pull_out=""
         _src_state="failed"
-        if _pull_out=$(_as_builder "git $_GIT_STALL_OPTS -C '$_bdir_escaped' pull" 2>>"$LOG_FILE"); then
+        if _pull_out=$(_as_builder "LC_ALL=C git $_GIT_STALL_OPTS -C '$_bdir_escaped' pull" 2>>"$LOG_FILE"); then
             if echo "$_pull_out" | grep -q "Already up to date"; then _src_state="skip"; else _src_state="changed"; fi
         elif _as_builder "git $_GIT_STALL_OPTS -C '$_bdir_escaped' fetch origin" >> "$LOG_FILE" 2>&1 \
             && _as_builder "git -C '$_bdir_escaped' reset --hard '@{u}'" >> "$LOG_FILE" 2>&1; then
@@ -712,8 +736,13 @@ for _bmod in "${ALL_MODULES[@]}"; do
         fi
 
         if [[ "$_src_state" == "skip" ]]; then
-            log_debug "Already latest: $_bname"
-            BUILD_SKIPPED=$((BUILD_SKIPPED + 1))
+            if setup_source_build_bins "$_bname" >> "$LOG_FILE" 2>&1; then
+                log_debug "Already latest: $_bname"
+                BUILD_SKIPPED=$((BUILD_SKIPPED + 1))
+            else
+                log_warn "Failed to expose built executable: $_bname"
+                BUILD_FAILED=$((BUILD_FAILED + 1))
+            fi
         elif [[ "$_src_state" == "failed" ]]; then
             log_warn "Failed to update: $_bname"
             BUILD_FAILED=$((BUILD_FAILED + 1))
@@ -742,7 +771,7 @@ for _bmod in "${ALL_MODULES[@]}"; do
                         _rebuilt=1
                     fi
                 fi
-                if [[ "$_rebuilt" == 1 ]]; then
+                if [[ "$_rebuilt" == 1 ]] && setup_source_build_bins "$_bname" >> "$LOG_FILE" 2>&1; then
                     log_success "Rebuilt: $_bname"
                     BUILD_UPDATED=$((BUILD_UPDATED + 1))
                     _track_update "$_bname" "source" "HEAD"

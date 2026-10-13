@@ -1,10 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # shellcheck disable=SC2034  # Arrays are consumed by scripts that source this module
 # Module: Enterprise
 # Active Directory, Kerberos, LDAP, Azure AD, Windows network pentesting,
 # credential harvesting, lateral movement
 
 ENTERPRISE_PACKAGES=()
+
+declare -gA ENTERPRISE_BINARY_ARCHITECTURES=([TeamFiltration]="amd64 arm64")
+declare -gA ENTERPRISE_BINARY_EXCLUSIVE_DIRS=([TeamFiltration]=true)
 
 ENTERPRISE_PIPX=(
     impacket certipy-ad coercer bloodhound mitm6

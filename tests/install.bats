@@ -101,6 +101,13 @@ setup() {
     assert_output --partial "crypto"
 }
 
+@test "install.sh ignores FAST_MODE and FORCE_YES from the environment (CL-10)" {
+    # An inherited FAST_MODE would silently disable checksum verification.
+    run env FAST_MODE=true FORCE_YES=true bash "$INSTALL_SH" --profile ctf --dry-run
+    assert_success
+    assert_output --partial "Fast mode:      false"
+}
+
 @test "install.sh --dry-run shows install functions" {
     run bash "$INSTALL_SH" --profile web --dry-run
     assert_success
@@ -277,6 +284,19 @@ EOF
     assert_output --partial "Parallel jobs:  1"
 }
 
+@test "install.sh rejects a non-numeric -j instead of silently using 4" {
+    run bash "$INSTALL_SH" --dry-run -j abc
+    assert_failure
+    assert_output --partial "requires a positive number"
+}
+
+@test "install.sh clamps -j above 16 with a warning" {
+    run bash "$INSTALL_SH" --dry-run -j 99
+    assert_success
+    assert_output --partial "using 16"
+    assert_output --partial "Parallel jobs:  16"
+}
+
 @test "install.sh --help shows -j/--parallel flag" {
     run bash "$INSTALL_SH" --help
     assert_success
@@ -378,6 +398,38 @@ EOF
     '
     assert_success
     assert_output --partial "SOURCE=massdns|https://github.com/blechschmidt/massdns.git|make"
+}
+
+@test "explicit pycdc and kernel checker installs provision their build dependencies" {
+    run bash -lc '
+        set --
+        export PKG_MANAGER=apt DISTRO_ID=debian DISTRO_NAME=debian
+        source "'"$INSTALL_SH"'"
+        LOG_FILE=/dev/null
+        install_apt_batch() { shift; echo "DEPENDENCIES=$*"; }
+        build_from_source() { echo "SOURCE=$1"; }
+        install_single_tool pycdc
+        install_single_tool kernel-hardening-checker
+    '
+    assert_success
+    assert_output --partial 'DEPENDENCIES=git cmake build-essential'
+    assert_output --partial 'DEPENDENCIES=git python3 python3-pip python3-venv'
+    assert_output --partial 'SOURCE=pycdc'
+    assert_output --partial 'SOURCE=kernel-hardening-checker'
+}
+
+@test "explicit source install stops when a required build package fails" {
+    run bash -lc '
+        set --
+        export PKG_MANAGER=apt DISTRO_ID=debian DISTRO_NAME=debian
+        source "'"$INSTALL_SH"'"
+        LOG_FILE=/dev/null
+        install_apt_batch() { TOTAL_TOOL_FAILURES=$((TOTAL_TOOL_FAILURES + 1)); }
+        build_from_source() { echo SHOULD_NOT_BUILD; }
+        install_single_tool pycdc
+    '
+    assert_failure
+    refute_output --partial SHOULD_NOT_BUILD
 }
 
 @test "install_single_tool resolves INCLUDE_C2-gated git tools (Hoaxshell)" {

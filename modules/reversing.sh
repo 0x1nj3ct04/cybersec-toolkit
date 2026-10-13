@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # shellcheck disable=SC2034  # Arrays are consumed by scripts that source this module
 # Module: Reverse Engineering
 # Disassembly, decompilation, debugging, binary analysis, emulation
@@ -23,18 +23,25 @@ RE_GIT=(
 )
 
 RE_GIT_NAMES=(pwndbg GEF peda decomp2dbg Qiling Krakatau pyinstxtractor)
-RE_BUILD_NAMES=(ELFkickers rappel)
+RE_BUILD_NAMES=(ELFkickers rappel pycdc)
 # Source of truth for build-from-source url + command (install + update). rappel is
 # x86-only, so install gates it on !IS_ARM; update skips it on ARM (never cloned).
 # -g: verify/update/remove source modules from inside a function.
 declare -gA RE_BUILD_URLS=(
     [ELFkickers]="https://github.com/BR903/ELFkickers.git"
     [rappel]="https://github.com/yrp604/rappel.git"
+    [pycdc]="https://github.com/zrax/pycdc.git"
 )
 declare -gA RE_BUILD_CMDS=(
     [ELFkickers]="make"
     [rappel]="make"
+    [pycdc]="cmake -S . -B build && cmake --build build --parallel"
 )
+declare -gA RE_BUILD_BINS=(
+    [pycdc]=$'build/pycdc|pycdc\nbuild/pycdas|pycdas'
+)
+declare -gA RE_BUILD_PACKAGES=([pycdc]="git cmake build-essential")
+declare -gA RE_BUILD_PACKAGES_ZYPPER=([pycdc]="git cmake gcc-c++ make")
 
 install_module_reversing() {
     install_apt_batch "Reversing - Packages" "${RE_PACKAGES[@]}"
@@ -49,12 +56,14 @@ install_module_reversing() {
     else
         build_from_source "rappel" "${RE_BUILD_URLS[rappel]}" "${RE_BUILD_CMDS[rappel]}" || true
     fi
+    build_from_source "pycdc" "${RE_BUILD_URLS[pycdc]}" "${RE_BUILD_CMDS[pycdc]}" || true
 
     install_binary_releases "${BINARY_RELEASES_REVERSING[@]}"
 
     if [[ -d "$GITHUB_TOOL_DIR/pwndbg" && -f "$GITHUB_TOOL_DIR/pwndbg/setup.sh" ]]; then
         _start_spinner "Setting up pwndbg..."
-        if (cd "$GITHUB_TOOL_DIR/pwndbg" && ./setup.sh >> "$LOG_FILE" 2>&1); then
+        # setup.sh is upstream code from a clone; run it as the builder, not root.
+        if _as_builder "cd '$(_escape_single_quoted "$GITHUB_TOOL_DIR/pwndbg")' && ./setup.sh" >> "$LOG_FILE" 2>&1; then
             _stop_spinner
             log_success "pwndbg setup complete"
         else
