@@ -15,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _skill_frontmatter import frontmatter as _frontmatter  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
+# SKILL.md bodies above this size load as one block; 256 KiB flags only the extreme outliers.
+MAX_SKILL_BODY_BYTES = 256 * 1024
 SKILLS_DIR = ROOT / ".claude" / "skills"
 INDEX = SKILLS_DIR / "SKILLS.md"
 CURATION_MD = SKILLS_DIR / "CURATION.md"
@@ -145,8 +147,7 @@ def _validate_curation(skill_dirs: list[Path], errors: list[str]) -> None:
             errors.append(f"{CURATION_JSON.relative_to(ROOT)}: extra skill(s): {', '.join(extra[:10])}")
 
     # Freshness: regenerate the curation outputs from the same rules curate_claude_skills.py
-    # uses and compare against the committed files, so stale/hand-edited content fails CI
-    # (the docs promise this validator checks "curation freshness").
+    # uses and compare against the committed files, so stale/hand-edited content fails CI.
     curate = _import_curate()
     if curate is None:
         errors.append("scripts/curate_claude_skills.py: could not import to verify curation freshness")
@@ -245,6 +246,7 @@ def main() -> int:
     check_args(set(), "usage: validate_claude_skills.py")
     errors: list[str] = []
     spec_warnings: list[str] = []
+    size_warnings: list[str] = []
 
     if not SKILLS_DIR.is_dir():
         print(f"ERROR: missing skills directory: {SKILLS_DIR.relative_to(ROOT)}")
@@ -279,6 +281,10 @@ def main() -> int:
             spec_warnings.append(
                 f"{skill_file.relative_to(ROOT)}: description is {len(description)} chars (>1024 spec guidance)"
             )
+        # The whole body loads on activation; very large bodies belong in references/.
+        body_size = skill_file.stat().st_size
+        if body_size > MAX_SKILL_BODY_BYTES:
+            size_warnings.append(f"{skill_file.relative_to(ROOT)}: SKILL.md is {body_size // 1024} KiB")
 
     python_script_count = _validate_python_scripts(skill_dirs, errors)
     powershell_script_count, powershell_skipped = _validate_powershell_scripts(skill_dirs, errors)
@@ -311,6 +317,10 @@ def main() -> int:
     if spec_warnings:
         print(f"NOTE: {len(spec_warnings)} skill(s) exceed the agentskills.io 1024-char description guidance:")
         for warning in spec_warnings:
+            print(f"  - {warning}")
+    if size_warnings:
+        print(f"NOTE: {len(size_warnings)} SKILL.md file(s) exceed {MAX_SKILL_BODY_BYTES // 1024} KiB; split them into references/:")
+        for warning in size_warnings:
             print(f"  - {warning}")
     if errors:
         print(f"FAILED: {len(errors)} issue(s) found")

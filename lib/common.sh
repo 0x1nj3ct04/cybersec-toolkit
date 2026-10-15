@@ -82,17 +82,6 @@ _child_pids() {
     done
 }
 
-# _kill_tree <pid> <signal> — signal every descendant of <pid>, children first.
-# Background jobs of a non-interactive shell ignore SIGINT, and per-tool installers
-# are grandchildren, so Ctrl+C alone (or `kill $(jobs -p)`) leaves them running.
-_kill_tree() {
-    local _c
-    for _c in $(_child_pids "$1"); do
-        _kill_tree "$_c" "$2"
-        kill -"$2" "$_c" 2>/dev/null || true
-    done
-}
-
 _process_start_time() {
     local _line
     { read -r _line < "/proc/$1/stat"; } 2>/dev/null || return 1
@@ -130,6 +119,7 @@ _signal_job() {
 _acquire_run_lock() {
     command -v flock &>/dev/null || return 0
     local _lock="${SCRIPT_DIR}/.versions.run.lock"
+    _unlink_if_symlink "$_lock"
     { exec {_RUN_LOCK_FD}>>"$_lock"; } 2>/dev/null || return 0
     if ! flock -n "$_RUN_LOCK_FD"; then
         log_error "Another install, update or remove run is active (lock: $_lock) — wait for it to finish"
@@ -211,6 +201,7 @@ track_session() {
     local tool="$1" method="$2" action="$3"
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    _unlink_if_symlink "${_SESSION_FILE}.lock"
     if command -v flock &>/dev/null; then
         (
             flock -x 200
@@ -290,8 +281,16 @@ disable_debug_trace() {
 # _init_log_file — safely initialize a log file with disk-full fallback.
 # Sets LOG_FILE to /dev/null if the file cannot be created.
 # Usage: _init_log_file "/path/to/logfile.log"
+# _unlink_if_symlink — the checkout is user-owned: a link planted at a fixed path root
+# writes to (log, lock files) would redirect that write onto any file.
+_unlink_if_symlink() {
+    [[ -L "$1" ]] && rm -f -- "$1"
+    return 0
+}
+
 _init_log_file() {
     local path="$1"
+    _unlink_if_symlink "$path"
     if : > "$path" 2>/dev/null; then
         chmod 600 "$path" 2>/dev/null || true
         LOG_FILE="$path"
@@ -768,7 +767,28 @@ pkg_install() {
     esac
 }
 
+# _pkg_remove_dependents — installed packages, beyond the requested ones, that removing "$@"
+# would take along. pacman -Rns already refuses such a removal; Termux pkg has no simulation.
+_pkg_remove_dependents() {
+    case "$PKG_MANAGER" in
+        apt)
+            apt-get -s remove "$@" 2>/dev/null | awk '/^Remv /{sub(/:.*/, "", $2); print $2}' \
+                | grep -vxF -f <(printf '%s\n' "${@%%:*}") || true
+            ;;
+        dnf|zypper)
+            command -v rpm &>/dev/null || return 0
+            rpm -e --test "$@" 2>&1 | sed -n 's/.* is needed by (installed) \(.*\)$/\1/p'
+            ;;
+    esac
+}
+
 pkg_remove() {
+    local _dependents
+    _dependents=$(_pkg_remove_dependents "$@" | sort -u | tr '\n' ' ')
+    if [[ -n "${_dependents// /}" ]]; then
+        log_error "Not removing $*: installed packages depend on it ($_dependents)"
+        return 1
+    fi
     case "$PKG_MANAGER" in
         apt)
             # autoremove can cascade into distro-owned packages, so it is opt-in
@@ -888,6 +908,16 @@ check_root() {
 #   - SUDO_USER is not set (direct root login / Docker)
 #   - Running on Termux (no root)
 # Usage: _as_builder "go install github.com/foo/bar@latest"
+# _strict_refuses_root_bootstrap — in strict mode (--production/--require-checksums), an
+# unsigned curl-pipe bootstrap must not run when _as_builder would run it as root.
+_strict_refuses_root_bootstrap() {
+    [[ "${REQUIRE_CHECKSUMS:-false}" == "true" ]] || return 1
+    [[ "$PKG_MANAGER" != "pkg" ]] || return 1
+    [[ -z "${SUDO_USER:-}" || "${SUDO_USER:-}" == "root" ]] || return 1
+    log_warn "Skipping $1 in strict mode: its installer script is unsigned and would run as root (run via sudo from a normal user, or install $1 yourself)"
+    return 0
+}
+
 _as_builder() {
     if [[ "$PKG_MANAGER" == "pkg" ]] || [[ -z "${SUDO_USER:-}" ]] || [[ "${SUDO_USER:-}" == "root" ]]; then
         bash -c "$1"; return $?
@@ -924,11 +954,7 @@ _builder_cmd() {
     printf '%s\n' "$resolved"
 }
 
-# _chown_for_builder — make directories writable by $SUDO_USER before privilege-dropped operations.
-# Root creates system directories (/opt, /usr/local/bin) but _as_builder runs as $SUDO_USER,
-# who cannot write to root-owned dirs.  Call this after mkdir to hand ownership to the builder.
-# No-op when not privilege-dropping (Termux, direct root login, Docker).
-# Usage: _chown_for_builder /opt/toolname [/opt/go ...]
+# _chown_for_builder — hand root-created dirs to $SUDO_USER before privilege-dropped steps; no-op otherwise.
 _chown_for_builder() {
     [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER:-}" != "root" ]] && [[ "$PKG_MANAGER" != "pkg" ]] || return 0
     # -h: never follow a symlink. Root chowning a user-planted link's target would
@@ -952,11 +978,7 @@ _builder_home() {
     if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER:-}" != "root" ]] && [[ "$PKG_MANAGER" != "pkg" ]]; then
         local _bh
         _bh=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
-        # getent may be missing or the NSS lookup may fail — an empty result
-        # would yield /-rooted bogus paths (/.cargo/bin). Fall back to a direct
-        # /etc/passwd lookup, then $HOME, requiring a non-empty absolute path.
-        # SUDO_USER is untrusted: it is passed to awk only as a data variable
-        # (never interpreted by a shell), so it cannot inject commands.
+        # getent may fail; fall back to /etc/passwd, then $HOME. SUDO_USER reaches awk only as data.
         [[ -z "$_bh" ]] && _bh=$(awk -F: -v u="$SUDO_USER" '$1==u{print $6; exit}' /etc/passwd 2>/dev/null)
         if [[ -n "$_bh" ]] && [[ "$_bh" == /* ]]; then
             echo "$_bh"
@@ -1065,11 +1087,11 @@ pipx_install() {
     if [[ -n "${PIPX_DEFAULT_PYTHON:-}" ]] && [[ "$PIPX_DEFAULT_PYTHON" != "python3" ]]; then
         _py_flag=(--python "$PIPX_DEFAULT_PYTHON")
     fi
-    if ! pipx install "${_py_flag[@]}" "$pkg" >> "$LOG_FILE" 2>&1; then
+    if ! pipx install ${_py_flag[@]+"${_py_flag[@]}"} "$pkg" >> "$LOG_FILE" 2>&1; then
         # Retry 1: --force in case of stale venvs
-        if ! pipx install "${_py_flag[@]}" "$pkg" --force >> "$LOG_FILE" 2>&1; then
+        if ! pipx install ${_py_flag[@]+"${_py_flag[@]}"} "$pkg" --force >> "$LOG_FILE" 2>&1; then
             # Retry 2: allow pip to upgrade transitive deps (fixes lxml/Python 3.13 etc.)
-            if pipx install "${_py_flag[@]}" "$pkg" --force --pip-args='--upgrade' >> "$LOG_FILE" 2>&1; then
+            if pipx install ${_py_flag[@]+"${_py_flag[@]}"} "$pkg" --force --pip-args='--upgrade' >> "$LOG_FILE" 2>&1; then
                 return 0
             fi
             # Retry 3: older Python versions (if available)
@@ -1176,6 +1198,11 @@ git_clone_or_pull() {
             fi
         fi
     else
+        # Never hand an existing directory we did not create to the builder; clone would fail anyway.
+        if [[ -e "$dest" ]] && { [[ ! -d "$dest" ]] || [[ -n "$(ls -A -- "$dest" 2>/dev/null)" ]]; }; then
+            log_warn "Not cloning $(basename "$dest"): $dest exists and is not a git clone"
+            return 1
+        fi
         mkdir -p "$dest" 2>/dev/null || true
         _chown_for_builder "$dest"
         log_info "Cloning $(basename "$dest")..."
@@ -1229,7 +1256,6 @@ _SPINNER_PID=""
 
 _start_spinner() {
     local label="$1"
-    # Kill any previous spinner (safety — shouldn't happen in practice)
     _stop_spinner
 
     # Non-interactive terminal (Docker, piped output): print one static line instead
@@ -1606,11 +1632,11 @@ _validate_module_names() {
     for _vmn in "$@"; do
         if [[ "$_vmn" == */* || "$_vmn" == *..* ]]; then
             log_error "Invalid module name (no path components allowed): $_vmn"
-            exit 1
+            exit 2
         fi
         if [[ " ${ALL_MODULES[*]} " != *" $_vmn "* ]]; then
             log_error "Unknown module: $_vmn ($_hint)"
-            exit 1
+            exit 2
         fi
     done
 }

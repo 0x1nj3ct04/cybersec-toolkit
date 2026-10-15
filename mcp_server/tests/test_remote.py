@@ -67,6 +67,13 @@ class TestRemoteHostConfig:
         reloaded = RemoteHostConfig(config_path=remote_config._path)
         assert len(reloaded.list_hosts()) == 10
 
+    def test_concurrent_sessions_keep_each_others_hosts(self, tmp_path: Path) -> None:
+        path = tmp_path / "remote_hosts.json"
+        session_a, session_b = RemoteHostConfig(config_path=path), RemoteHostConfig(config_path=path)
+        session_a.add_host("lab-a", "10.0.0.5")
+        session_b.add_host("lab-b", "10.0.0.6")
+        assert set(json.loads(path.read_text())["hosts"]) == {"lab-a", "lab-b"}
+
     def test_add_host_empty_name_raises(self, remote_config: RemoteHostConfig) -> None:
         with pytest.raises(ValueError, match="name must not be empty"):
             remote_config.add_host(name="", hostname="10.0.0.1")
@@ -340,6 +347,17 @@ class TestExecuteRemoteCommand:
         assert result["exit_code"] == -1
         assert "timed out" in result["stderr"]
         assert result["remote"] is True
+
+    @pytest.mark.asyncio
+    async def test_cancellation_kills_local_ssh_client(self) -> None:
+        mock_proc = AsyncMock()
+        mock_proc.communicate.side_effect = asyncio.CancelledError()
+        mock_proc.kill = MagicMock()
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc), pytest.raises(asyncio.CancelledError):
+            await execute_remote_command(["user@host"], ["nmap", "10.0.0.1"])
+
+        mock_proc.kill.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_output_truncation(self) -> None:

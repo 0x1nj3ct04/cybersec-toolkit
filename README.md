@@ -18,8 +18,6 @@
       |_|                     Toolkit
 ```
 
-<p align="center"><em>&ldquo;I am a friend of virtue, not of fortune.&rdquo;</em><br>&mdash; Gjergj Kastrioti &middot; Skanderbeg (1405&ndash;1468)</p>
-
 __A security toolkit that AI agents can drive, under rules you set.__ One command installs 670+ security tools on Linux or Termux. An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server lets Claude Code, Codex, Gemini CLI, OpenCode, and other MCP clients discover, recommend, and run those tools through a governed execution path, inside a disposable Kata Containers VM by default. 872 Agent Skills supply the methodology for CTF, pentest, bug bounty, DFIR, and blue-team work.
 
 | Component | What you get |
@@ -38,12 +36,12 @@ __A security toolkit that AI agents can drive, under rules you set.__ One comman
 __1. Install the tools__ on a supported Linux distro or on Termux:
 
 ```bash
-git clone --depth 1 --branch v1.3.0 https://github.com/26zl/cybersec-toolkit.git && cd cybersec-toolkit
+git clone --depth 1 --branch v1.4.0 https://github.com/26zl/cybersec-toolkit.git && cd cybersec-toolkit
 ./install.sh --doctor             # read-only preflight: distro, prerequisites, MCP server, sandbox
 sudo ./install.sh --profile ctf   # one profile; with no flags, all 18 modules
 ```
 
-__2. Connect an AI client.__ The tracked configs for Claude Code (`.mcp.json`), Codex, Gemini CLI, and OpenCode start the server through `scripts/mcp-launch.sh`, with external targets and script execution disabled. Choose where the tools run:
+__2. Connect an AI client.__ The tracked configs for Claude Code (`.mcp.json`, also read by the GitHub Copilot CLI), Codex, Gemini CLI, and OpenCode start the server through `scripts/mcp-launch.sh`, with external targets and script execution disabled. Choose where the tools run:
 
 | Mode | Tools run | Host needs | One-time setup |
 | ---- | --------- | ---------- | -------------- |
@@ -78,7 +76,7 @@ What runs, and what is gated:
 - __Tool output goes to your model provider.__ Whatever a tool prints — scan results, page content, and any credential or personal data it finds on a target — is returned to the AI client and sent to the model it uses. By default only the local audit log is redacted; set `CYBERSEC_MCP_REDACT_OUTPUT=1` to also redact credential-shaped strings from what the client receives. If an engagement's rules forbid sharing client data with a third party, drive the server from a local model (see [AI clients](docs/AI_CLIENTS.md)).
 - __Repository hooks run automatically.__ Opening this repository in Claude Code runs the tracked hooks in `.claude/settings.json`: `scripts/agent-guard.sh` at session start and before each Bash command. They only emit routing context or a deny decision, make no network calls, and fail open; set `CYBERSEC_AGENT_GUARD=0` to disable them.
 - __Audit trail without leaks.__ Actions are logged as JSON lines to an owner-only (`0600`), rotating log under the user's state directory (`~/.local/state/cybersec-tools-mcp/audit.log` by default). Script bodies are never stored, only their SHA256 and length, and credential-shaped strings are redacted from tool arguments. A sandboxed server mirrors its records to the same host log, and records are hash-chained, so an edited or deleted record inside a chain shows up in `make audit-verify` ([limits](docs/SANDBOX.md#tamper-evidence)).
-- __Least privilege in the installer.__ It runs as root but drops to the invoking user (`$SUDO_USER`) for cloned-repo builds, `go`/`cargo`/`gem` builds, and project setup steps (theHarvester, pwndbg); binary releases are SHA256-verified when checksums are published. `pipx` installs (into the shared `/opt/pipx`) and global `npm` installs still run as root, so their build and install scripts execute with root privileges — see the [supply chain model](#supply-chain-model).
+- __Least privilege in the installer.__ It runs as root but drops to the invoking user (`$SUDO_USER`) for cloned-repo builds, `go`/`cargo`/`gem` builds, and project setup steps (theHarvester, pwndbg); binary releases are SHA256-verified when checksums are published. `pipx` installs (into the shared `/opt/pipx`) and global `npm` installs still run as root, so their build and install scripts execute with root privileges — see the [supply chain model](#supply-chain-model). Go binaries are copied into `/usr/local/bin` as root-owned files; cargo, gem, cloned-repo, source-build, patator and Foundry tools are exposed there as links or wrappers into trees the invoking user owns, so that user can change what those commands run.
 - __Dual-use tooling is gated.__ C2 and phishing frameworks (Sliver, Caldera, gophish, evilginx, …) are __off by default__ and install only with `--include-c2` (the `redteam` and `full` profiles set it); the MCP layer reflects this and never auto-runs them.
 - __Authorized use only.__ See [`SECURITY.md`](SECURITY.md), the [supply chain model](#supply-chain-model), and the [disclaimer](#disclaimer).
 
@@ -96,7 +94,7 @@ A supported Linux distro (Debian/Ubuntu/Kali/Parrot, Fedora/RHEL, Arch, openSUSE
 __From the latest release__ (pinned; recommended):
 
 ```bash
-git clone --depth 1 --branch v1.3.0 https://github.com/26zl/cybersec-toolkit.git && cd cybersec-toolkit && sudo ./install.sh
+git clone --depth 1 --branch v1.4.0 https://github.com/26zl/cybersec-toolkit.git && cd cybersec-toolkit && sudo ./install.sh
 ```
 
 __From `main`__ (newest tools and fixes, including unreleased work):
@@ -146,6 +144,8 @@ sudo ./install.sh -v                    # Verbose / debug output
 
 `--tool` installs only the named tool, without the full dependency setup. Dry-run time estimates count install entries across methods, so they can exceed the de-duplicated 670+ tool registry.
 
+Tuning variables (environment): `GITHUB_TOOL_DIR` (default `/opt`, `~/tools` on Termux) sets where repositories are cloned; `GO_MIN_VERSION` (default `1.21`), `PYTHON_MIN_VERSION` / `PYTHON_TRY_MAX` (`3.11` / `3.13`) and `NODE_MIN_VERSION` (`22`) set the runtime versions the bootstrap accepts; `ZYPPER_REFRESH_ATTEMPTS` / `ZYPPER_REFRESH_DELAY` (`3` / `15` seconds, doubling) tune openSUSE metadata retries; `CYBERSEC_ZYPPER_AUTO_IMPORT_KEYS=1` trusts new repository keys on refresh (see the [supply chain model](#supply-chain-model)); `PKG_AUTOREMOVE=1` adds `apt-get autoremove` to package removal (`remove.sh --remove-deps` sets it).
+
 </details>
 
 <details>
@@ -162,7 +162,7 @@ The time goes to I/O-bound work that no scripting language can speed up:
 | Git clones | Cloning each repository |
 | Binary releases | Downloading pre-built binaries from GitHub |
 
-`./install.sh --dry-run` prints the live per-method breakdown. pipx, Go, git, and binary installs run in parallel (`-j 4` by default); the system package manager and Cargo run sequentially. To go faster: install a profile or `--module` instead of everything, `--skip-cargo` to avoid Rust compilation, `-j 8` for more parallel jobs, and an [apt-cacher-ng](https://wiki.debian.org/AptCacherNg) proxy for repeated installs.
+`./install.sh --dry-run` prints the live per-method breakdown. pipx, Go, git, and binary installs run in parallel (`-j 4` by default); the system package manager, Cargo, gem, npm, and source builds run sequentially. To go faster: install a profile or `--module` instead of everything, `--skip-cargo` to avoid Rust compilation, `-j 8` for more parallel jobs, and an [apt-cacher-ng](https://wiki.debian.org/AptCacherNg) proxy for repeated installs.
 
 </details>
 
@@ -217,15 +217,15 @@ Docker and C2 show what each profile enables by default. A profile that enables 
 | `web` | 60 | Vulnerability scanning, fuzzing, SQLi, XSS, CMS scanners, API testing |
 | `crypto` | 15 | RSA attacks, cipher analysis, hash attacks, constraint solving |
 | `pwn` | 36 | Exploit frameworks, binary exploitation, fuzzing, payload generation |
-| `reversing` | 33 | Disassemblers, debuggers, emulation, Java/Python reversing |
-| `forensics` | 57 | Disk/memory forensics, file carving, timeline analysis, log analysis, hardware/serial |
-| `enterprise` | 80 | Active Directory, Kerberos, Azure AD, credential harvesting, lateral movement |
+| `reversing` | 34 | Disassemblers, debuggers, emulation, Java/Python reversing |
+| `forensics` | 59 | Disk/memory forensics, file carving, timeline analysis, log analysis, hardware/serial |
+| `enterprise` | 81 | Active Directory, Kerberos, Azure AD, credential harvesting, lateral movement |
 | `wireless` | 41 | WiFi cracking, Bluetooth, SDR, rogue AP |
 | `cracking` | 34 | Hash cracking (john, hashcat), brute force, wordlist generation |
 | `stego` | 15 | Image/audio steganography, detection, StegCracker |
 | `cloud` | 22 | AWS/Azure/GCP security auditing, Checkov |
 | `containers` | 15 | Docker/Kubernetes security (Grype, Syft, Kubescape, kubeaudit) |
-| `blueteam` | 36 | IDS/IPS, SIEM, incident response, threat intelligence, hardening, malware analysis (YARA, ClamAV, FLOSS, Capa, Loki) |
+| `blueteam` | 40 | IDS/IPS, SIEM, incident response, threat intelligence, hardening, malware analysis (YARA, ClamAV, FLOSS, Capa, Loki) |
 | `mobile` | 18 | Android/iOS app testing, APK analysis, MobSF (Docker) |
 | `blockchain` | 15 | Smart contract auditing (Slither, Mythril, Foundry, Aderyn), blockchain forensics, Echidna (Docker) |
 | `llm` | 14 | LLM red teaming, prompt injection, jailbreak testing, AI vulnerability scanning |
@@ -236,11 +236,11 @@ Docker and C2 show what each profile enables by default. A profile that enables 
 | Method | Count | Examples |
 | ------ | ----- | ------- |
 | Git clone | 193 | GitHub repos with auto-setup, resources, wordlists |
-| System packages (apt/dnf/pacman/zypper) | 166 | nmap, wireshark, john, hashcat |
+| System packages (apt/dnf/pacman/zypper) | 168 | nmap, wireshark, john, hashcat |
 | pipx | 137 | sqlmap, impacket, bloodhound, volatility3 |
-| Go install | 62 | nuclei, subfinder, ffuf, httpx |
-| Binary release | 51 | gitleaks, chainsaw, findomain, FLOSS, Capa, Loki, Syft, Kubescape |
-| Build from source | 23 | massdns, duplicut, AFLplusplus, honggfuzz |
+| Go install | 63 | nuclei, subfinder, ffuf, httpx |
+| Binary release | 54 | gitleaks, chainsaw, findomain, FLOSS, Capa, Loki, Syft, Kubescape |
+| Build from source | 25 | massdns, duplicut, AFLplusplus, honggfuzz |
 | Docker | 13 | Empire, MobSF, BeEF, BloodHound, TheHive, Cortex, PentAGI |
 | Cargo (Rust) | 8 | feroxbuster, RustScan, pwninit, yara-x-cli |
 | Ruby gem | 6 | wpscan, evil-winrm, brakeman |
@@ -252,17 +252,17 @@ Docker and C2 show what each profile enables by default. A profile that enables 
 
 ### Post-install scripts
 
-All scripts support `--help` and `--version`. On Linux, `update.sh` and `remove.sh` need root (`sudo`), as does `backup.sh schedule`; `verify.sh` and the other `backup.sh` commands run as your user. Termux needs no root. Without a terminal, pass `--yes` to `remove.sh` (and to `install.sh --rollback`).
+All scripts support `--help` and `--version`. On Linux, `update.sh` and `remove.sh` need root (`sudo`), as do `backup.sh schedule` and `unschedule`; `verify.sh` and the other `backup.sh` commands run as your user. Termux needs no root. Without a terminal, pass `--yes` to `remove.sh` (and to `install.sh --rollback`).
 
 | Script | Purpose | Example |
 | ------ | ------- | ------- |
 | `scripts/verify.sh` | Check which tools are installed | `./scripts/verify.sh --module web --skip-heavy` |
-| `scripts/update.sh` | Update all installed tools | `sudo ./scripts/update.sh --skip-system` |
+| `scripts/update.sh` | Update the tools this toolkit installed | `sudo ./scripts/update.sh --skip-system` |
 | `scripts/remove.sh` | Remove tools by module | `sudo ./scripts/remove.sh --module enterprise --yes` |
-| `scripts/remove.sh --deep-clean` | Purge caches and build artifacts | `sudo ./scripts/remove.sh --deep-clean --yes` |
-| `scripts/backup.sh` | Back up and restore tool configs | `sudo ./scripts/backup.sh backup` |
+| `scripts/remove.sh --deep-clean` | Remove all toolkit tools, then purge caches and build artifacts | `sudo ./scripts/remove.sh --deep-clean --yes` |
+| `scripts/backup.sh` | Back up and restore tool configs | `./scripts/backup.sh backup` |
 
-`--deep-clean` removes the Go module/build cache, the Cargo registry, pip/pipx/npm/gem caches, orphaned pipx venvs, stale symlinks, and log files. Add `--remove-deps` to also purge Rustup toolchains.
+After a full removal, `--deep-clean` removes the Go module/build cache, the Cargo registry, pip/pipx/npm/gem caches, orphaned pipx venvs, stale symlinks, and log files. Add `--remove-deps` to also purge Rustup toolchains.
 
 <details>
 <summary><strong>Tool locations</strong></summary>
@@ -311,7 +311,7 @@ __Debian/Ubuntu/Kali is the primary target__ and has the strongest test coverage
 | Platform | Status |
 | -------- | ------ |
 | __WSL__ | Supported for installs and MCP use; the wireless module and kernel-level packages are skipped. No dedicated CI job, so validate release-critical changes in a local WSL distro. See [Windows Defender false positives](#windows-defender-false-positives) if the repo lives on a Windows-mounted path. |
-| __ARM__ (aarch64/armv7) | Supported, with automatic skips for x86-only binary releases and build-from-source tools. No dedicated CI job. |
+| __ARM__ (aarch64/armv7) | Supported, with automatic skips for x86-only binary releases and x86-only build-from-source tools. No dedicated CI job. |
 | __Termux__ (Android) | Supported without sudo. Docker, snap, binary releases, and build-from-source are skipped (Bionic incompatible). No dedicated CI job. |
 | __Windows__ (native) | Not supported. Use WSL. |
 | __macOS__ | The installer is not supported; use the Docker image. The MCP server runs on macOS in host mode (`--local`). |
@@ -330,7 +330,7 @@ Beyond installing packages, an install can change the system in ways `remove.sh`
 Data the toolkit keeps, stored only on this machine:
 
 - `.versions`, `.install_sessions/`, and `*.log` in the checkout: install provenance and logs.
-- `~/.local/state/cybersec-tools-mcp/`: the MCP audit log and its rotations, `remote_hosts.json`, and the agent guard's `guard-session` and `guard-denials.log`.
+- `~/.local/state/cybersec-tools-mcp/`: the MCP audit log and its rotations, `remote_hosts.json`, and the agent guard's `guard-session*` markers and `guard-denials.log`.
 - `~/cybersec_tools_backup/`: encrypted configuration backups.
 - `writeups/` in the checkout (git-ignored).
 
@@ -340,12 +340,12 @@ Data the toolkit keeps, stored only on this machine:
 
 The installer downloads and runs code from the internet. On Linux it runs as root (`sudo`); on Termux it runs in the app's user sandbox.
 
-- __System packages__: signed by your distro's repositories (apt, dnf, pacman, zypper, pkg).
+- __System packages__: signed by your distro's repositories (apt, dnf, pacman, zypper, pkg). On openSUSE, `zypper refresh` trusts new or rotated repository keys automatically only when `CI=true` or `CYBERSEC_ZYPPER_AUTO_IMPORT_KEYS=1` is set.
 - __pipx/Go/Cargo/Gem/npm__: fetched from their registries without signature verification; pipx tools are isolated in venvs. Go, Cargo, and Gem builds run as the invoking user; pipx and global npm installs run as root, so package build backends and npm lifecycle scripts execute with root privileges.
 - __Binary releases__: SHA256-verified using upstream checksum files, exact-asset GitHub release digests, or reviewed repository/tag/asset checksums in `lib/release_checksums.tsv`. A mismatch always fails; `--require-checksums` or `--production` also fails when verification data is unavailable. These checks establish download integrity, not independent publisher authentication. `--fast` skips ordinary release verification and cannot be combined with strict flags; private runtime dependencies always require verification.
-- __Runtime bootstraps__: the rustup, uv, and cargo-binstall installers and NodeSource's setup script (run as root) are fetched over HTTPS and sanity-checked before they run, but not signature-verified. cargo-binstall then downloads prebuilt Rust binaries where available; `--skip-source` skips its installer on a fresh host, so Rust tools compile from crates.io.
+- __Runtime bootstraps__: the rustup, uv, and cargo-binstall installers and NodeSource's setup script (run as root) are fetched over HTTPS and sanity-checked before they run, but not signature-verified; in strict mode (`--production`/`--require-checksums`) the rustup, uv, and cargo-binstall installers are skipped when they would run as root (i.e. without `sudo` from a normal user), and NodeSource's script is always skipped in favour of the distro's signed `nodejs`/`npm`. cargo-binstall then downloads prebuilt Rust binaries where available; `--skip-source` skips its installer on a fresh host, so Rust tools compile from crates.io.
 - __Go SDK__: SHA256-verified against go.dev when the API is reachable; strict mode fails if it is not.
-- __Git repos__: cloned at HEAD; dependencies go into isolated venvs, and `setup.py` is not executed.
+- __Git repos__: cloned at HEAD; the repo's own `setup.py` is never run. `requirements.txt` installs into a per-repo venv as the invoking user, where dependency sdists can still build, and outside strict mode (`--production` or `--require-checksums`) a failed pinned install is retried with `==` relaxed to `>=`.
 - __Build from source__: runs `make` as the invoking user, not root. Review what you build.
 - __MCP Python dependencies__: resolved by `uv` with a 3-day `exclude-newer` window, and Dependabot waits the same 3 days. This does not apply to the security tools themselves, which follow their upstream release channels.
 - __Toolkit Docker images__: Ubuntu and uv are digest-pinned; apt packages resolve from the current signed Ubuntu repositories, so rebuilds are not bit-for-bit reproducible.
@@ -379,24 +379,9 @@ The server gives MCP-capable clients read access to the 670+ tool registry, inst
 
 ### Supported clients
 
-| Client | Integration | Status |
-| ------ | ----------- | ------ |
-| Claude Code | `.mcp.json` (tracked) + `.claude/skills/` | Native configuration included |
-| Claude Desktop | `claude_desktop_config.json` | Configuration example documented |
-| OpenCode | `opencode.jsonc` (tracked) + `.agents/skills/` | Live tested |
-| Codex | `.codex/config.toml` (tracked) | Native configuration included |
-| Gemini CLI | `GEMINI.md` + `.gemini/settings.json` (tracked) | Native configuration included |
-| GitHub Copilot | `.mcp.json` (CLI) + `.github/copilot-instructions.md` | CLI live tested; VS Code documented |
-| Hermes Agent | User `~/.hermes/config.yaml` | Live tested |
-| OpenClaw | User `~/.openclaw/openclaw.json` + `.agents/skills/` | Live tested |
-| DeepSeek Harness (dsh) | `$DSH_HOME/settings.yaml` + `.agents/skills/` | Configuration example documented |
-| Cursor / Cline / Goose | Client MCP settings + Agent Skills | Compatible through MCP; skills supported |
-| Continue | Client MCP settings; rules/prompts for context | Compatible through MCP |
-| LM Studio (>=0.3.17) | `mcp.json`; manual or MCP-provided context | Compatible through MCP |
-| Ollama | MCP host in front of it | Compatible through an MCP host |
-| Open WebUI | MCP-to-OpenAPI bridge | Compatible through an MCP host or bridge |
+Claude Code, Codex, Gemini CLI, OpenCode and the GitHub Copilot CLI pick up the tracked configs automatically; Claude Desktop, Copilot in VS Code, Hermes Agent, OpenClaw, DeepSeek Harness, Cursor, Cline, Goose, Continue and LM Studio connect through their own MCP settings, and Ollama or Open WebUI through an MCP host or bridge. The support matrix, with skill discovery and test status per client, lives in [`docs/AI_CLIENTS.md`](docs/AI_CLIENTS.md).
 
-Per-client setup is in [`docs/AI_CLIENTS.md`](docs/AI_CLIENTS.md); coordinating several agents across any MCP client is in [`docs/ORCHESTRATION.md`](docs/ORCHESTRATION.md).
+Coordinating several agents across any MCP client is in [`docs/ORCHESTRATION.md`](docs/ORCHESTRATION.md).
 
 The server is published to the [official MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.26zl/cybersec-toolkit` and listed on Glama:
 
@@ -487,12 +472,12 @@ The agent can query every tool and its install state, chain governed tool calls,
 - __The VM has its own tool set.__ The sandbox image ships the MCP server plus `file`, `git`, `binutils`, `nmap`, `curl`, and Python. Tools installed on the host are not visible inside it, and `check_installed` and the advisors report the guest's tools. Bake a profile into the image instead, and rebuild after pulling server changes, because the image carries its own copy of the server:
 
   ```bash
-  docker build -f sandbox/Dockerfile --build-arg TOOLKIT_PROFILE=ctf -t cybersec-toolkit-sandbox:latest .
+  make sandbox-image TOOLKIT_PROFILE=ctf
   ```
 
 - __Files__: the VM sees no host path unless `CYBERSEC_SANDBOX_WORKSPACE` names an absolute directory, which appears as `/workspace` (read-only with `CYBERSEC_SANDBOX_WORKSPACE_RO=1`). Pass guest paths to `run_tool`.
 - __Network__: the VM uses Docker's default bridge. Set `CYBERSEC_SANDBOX_NETWORK=none` for offline analysis, or a filtered Docker network to scope egress.
-- __Privileges__: uid 10001, all capabilities dropped, `no-new-privileges`, and 2 GB / 2 vCPUs / 512 processes by default. Raw-socket scans (`nmap -sS`, `-sU`, OS detection) need `CYBERSEC_SANDBOX_CAP_ADD=NET_RAW`.
+- __Privileges__: uid 10001, all capabilities dropped, `no-new-privileges`, and 2 GB / 2 vCPUs / 512 processes by default. Raw-socket scans (`nmap -sS`, `-sU`, OS detection) are not available in the sandbox: the guest user is unprivileged and `no-new-privileges` is set, so an added `NET_RAW` capability never becomes effective. Use connect scans (`-sT`) or `--local` mode.
 - __Host mode only__: remote execution over SSH (`manage_remote_hosts`) and venvs under `~/.ctf-venvs/` that you created on the host.
 - __Audit__: records leave the VM on a stderr side channel and are appended to the host log, so the trail outlives the VM.
 
@@ -598,7 +583,7 @@ Reusable helpers the agent writes for you (exploits, multi-step solvers, parsers
 ### Test the server
 
 ```bash
-cd mcp_server && uv run fastmcp dev server.py
+cd mcp_server && uv run fastmcp dev inspector server.py
 ```
 
 This opens the MCP Inspector for exercising each tool interactively. [`mcp_server/README.md`](mcp_server/README.md) covers Claude Desktop setup and the full server reference.
@@ -629,7 +614,7 @@ __As a Claude Code plugin.__ The repo doubles as a [plugin marketplace](https://
 
 The plugin carries the skills only; the MCP server is configured separately (see [MCP server](#mcp-server)).
 
-__In other clients.__ OpenCode, Codex, Gemini CLI, GitHub Copilot, Cursor, Cline, Goose, Hermes, and OpenClaw support Agent Skills through their own paths. `scripts/sync-skills.sh` mirrors `.claude/skills/` into the git-ignored `.agents/skills/` for clients that read that location (`--check` reports drift; `make setup` runs it). Continue and LM Studio do not document automatic skill discovery; give them selected skill content as rules or context instead. Details: [`docs/AI_CLIENTS.md`](docs/AI_CLIENTS.md).
+__In other clients.__ OpenCode, Codex, Gemini CLI, GitHub Copilot, Cursor, Cline, Goose, Hermes, OpenClaw, and DeepSeek Harness support Agent Skills through their own paths. `scripts/sync-skills.sh` mirrors `.claude/skills/` into the git-ignored `.agents/skills/` for clients that read that location (`--check` reports drift; `make setup` runs it). Continue and LM Studio do not document automatic skill discovery; give them selected skill content as rules or context instead. Details: [`docs/AI_CLIENTS.md`](docs/AI_CLIENTS.md).
 
 __Helper-script dependencies.__ Some vendored skills include helper scripts with optional Python imports, declared in [`.claude/skills/requirements.txt`](.claude/skills/requirements.txt) and generated from the import inventory. `scripts/validate_claude_skills.py` checks skill metadata, index counts, curation freshness, and helper-script syntax.
 
@@ -650,7 +635,7 @@ make check    # lint, validators, bats, pytest, sandbox tests
 
 `make help` lists every target; the raw commands are in [`AGENTS.md`](AGENTS.md). The MCP Python project resolves dependencies with `uv` and `exclude-newer = "3 days"`, so fresh releases are ignored for 72 hours to limit the blast radius of a compromised upload; Dependabot and the weekly uv update workflow use the same cooldown. Run the shell tests on Linux, macOS, or WSL: native Windows checkouts can rewrite the Bats submodules with CRLF and fail with `$'\r'`.
 
-Release notes for every version, including security fixes and upgrade steps, are on the [GitHub Releases](https://github.com/26zl/cybersec-toolkit/releases) page; `git log v1.3.0..` shows what has landed since a release.
+Release notes for every version, including security fixes and upgrade steps, are on the [GitHub Releases](https://github.com/26zl/cybersec-toolkit/releases) page; `git log $(git describe --tags --abbrev=0)..` shows what has landed since the latest release.
 
 ## Star History
 

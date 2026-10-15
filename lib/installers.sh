@@ -181,7 +181,6 @@ install_apt_batch() {
 
     # Fast path: try all packages in one transaction (~50-80% faster)
     if pkg_install "${packages[@]}" >> "$LOG_FILE" 2>&1; then
-        # All succeeded — track versions in bulk
         for pkg in "${packages[@]}"; do
             _track_pkg "$pkg"
         done
@@ -219,7 +218,6 @@ install_apt_batch() {
                 group=()
             fi
         done
-        # Handle remaining packages
         if [[ ${#group[@]} -gt 0 ]]; then
             if pkg_install "${group[@]}" >> "$LOG_FILE" 2>&1; then
                 for _g in "${group[@]}"; do
@@ -341,6 +339,8 @@ install_pipx_batch() {
         local _symlinked=0
         for _f in "$_fallback_dir"/*; do
             [[ -f "$_f" ]] && [[ -x "$_f" ]] || continue
+            # Only pipx entry points (links into a pipx venv), not unrelated user binaries.
+            [[ -L "$_f" && "$(readlink -f "$_f")" == */pipx/venvs/* ]] || continue
             local _bname
             _bname=$(basename "$_f")
             if [[ ! -f "$PIPX_BIN_DIR/$_bname" ]] && [[ ! -L "$PIPX_BIN_DIR/$_bname" ]]; then
@@ -378,13 +378,8 @@ install_pipx_batch() {
     return 0
 }
 
-# install_ctf_venv — create/populate a named venv under CYBERSEC_MCP_VENVS_DIR
-# (default ~/.ctf-venvs) so the MCP server can hand it to run_script(venv=NAME).
-# Python libraries without console scripts cannot go through pipx at all
-# ("No apps associated with package pycryptodome"), and installing them
-# system-wide fights PEP 668 — a venv is the only path that serves both.
-# One pip call per package: a single library with no wheel for the host
-# Python/arch then fails alone instead of taking the whole set with it.
+# install_ctf_venv — populate <CYBERSEC_MCP_VENVS_DIR or ~/.ctf-venvs>/<name> for run_script(venv=NAME).
+# Libraries without console scripts cannot use pipx; one pip call per package isolates wheel failures.
 install_ctf_venv() {
     local name="$1"; shift
     local -a libs=("$@")
@@ -775,8 +770,8 @@ install_gem_batch() {
 
 # Post-clone setup for git repos
 # Creates isolated venvs for Python repos with requirements.txt.
-# Does NOT execute setup.py/pyproject.toml (supply-chain risk: arbitrary code as root).
-# Only installs pinned dependencies from requirements.txt into the venv.
+# Never runs the repo's own setup.py/pyproject.toml; requirements.txt installs into the venv
+# as $SUDO_USER, where dependency sdists can still build.
 #
 # Wrapper creation cascade (first match wins):
 #   1. Python + requirements.txt → venv + symlink entry points
@@ -798,13 +793,8 @@ setup_git_repo() {
     [[ -f "$PIPX_BIN_DIR/$name_lower" ]] && return 0
 
     # 1. Python project with requirements.txt
-    # The venv and ALL pip operations run as $SUDO_USER via _as_builder (not root).
-    # setup.py is not invoked directly, but `pip install -r requirements.txt` can still
-    # build sdists (running their setup.py/PEP-517 backend) — running as the unprivileged
-    # builder limits the blast radius of a malicious/compromised cloned-repo dependency,
-    # and keeps the venv owned by $SUDO_USER (so later privilege-dropped git pulls work).
-    # The final symlink into $PIPX_BIN_DIR stays as root (system path), matching how
-    # go/cargo/gem stage user-built binaries then symlink as root.
+    # pip runs as the builder so sdist build backends never execute as root; the venv stays
+    # builder-owned for later pulls. Only the link into $PIPX_BIN_DIR is made as root.
     if [[ -f "$dest/requirements.txt" ]]; then
         local _dest_esc; _dest_esc="$(_escape_single_quoted "$dest")"
         if [[ ! -d "$dest/venv" ]]; then
@@ -1725,7 +1715,7 @@ for asset in data.get('assets', []):
             if [[ "$mode" == "install" ]]; then
                 if command_exists "$binary"; then
                     log_success "Installed: $binary (.deb)"
-                    track_version "$binary" "binary" "${release_tag:-latest}"
+                    _record_release_version "$binary" "$dest_dir" "${release_tag:-latest}"
                 else
                     log_error "Install failed: $binary (.deb) — binary not found after dpkg"
                     return 1
@@ -1756,7 +1746,7 @@ WRAPPER
             rm -rf "$tmp_dir"
             if [[ "$mode" == "install" ]]; then
                 log_success "Installed: $binary (.jar)"
-                track_version "$binary" "binary" "${release_tag:-latest}"
+                _record_release_version "$binary" "$dest_dir" "${release_tag:-latest}"
             fi
             return 0 ;;
         *)
@@ -1916,11 +1906,18 @@ docker_pull() {
         return 1
     fi
 
+    # An image the host already had must not become ours, or rollback would remove it.
+    local _present=false
+    docker image inspect "$image" >/dev/null 2>&1 && _present=true
     _start_spinner "Pulling Docker image: $name..."
     if docker pull "$image" >> "$LOG_FILE" 2>&1; then
         _stop_spinner
         log_success "Docker: $name ready"
-        track_version "$name" "docker" "$image"
+        if [[ "$_present" == "true" ]]; then
+            _track_already_present "$name" "docker"
+        else
+            track_version "$name" "docker" "$image"
+        fi
     else
         _stop_spinner
         log_error "Docker pull failed: $name"
@@ -1961,6 +1958,7 @@ track_version() {
     }
 
     # Use flock when available (parallel safety), fall back to mkdir-based lock
+    _unlink_if_symlink "${version_file}.lock"
     if command -v flock &>/dev/null; then
         (
             flock -x 200
@@ -2087,7 +2085,7 @@ build_from_source() {
         [[ "$is_existing" == "false" ]] && _cleanup_failed_source_build "$name"
         return 1
     fi
-    # Build in a subshell (preserves caller's CWD) via _as_builder (build as user, not root); build_cmd is a trusted *_BUILD_CMDS string passed verbatim to `bash -c` — do NOT quote-escape it, that corrupts its own quotes (e.g. yafu/pemcrack `sed '...'` patches).
+    # build_cmd is a trusted *_BUILD_CMDS string run verbatim by bash -c as the builder; escaping it would break its own quoting.
     if (cd "$dest" && _as_builder "$build_cmd") >> "$LOG_FILE" 2>&1 \
         && setup_source_build_bins "$name" >> "$LOG_FILE" 2>&1; then
         _stop_spinner
@@ -2305,6 +2303,7 @@ remove_npm_packages() {
     for pkg in "${pkgs[@]}"; do
         if npm ls -g --depth=0 "$pkg" >/dev/null 2>&1; then
             if npm uninstall -g "$pkg" >> "$LOG_FILE" 2>&1; then
+                REMOVED_TOOLS+=("$pkg")
                 removed=$((removed + 1))
             else
                 log_warn "Failed to remove npm package: $pkg"
@@ -2625,9 +2624,9 @@ install_zap() {
     fi
 }
 
-# Uninstall helpers for non-batch install methods
-# Shared by install.sh --rollback and scripts/remove.sh. Idempotent; return 1 only
-# for a name the helper does not know, so callers can fall through.
+# Uninstall helpers for non-batch install methods, shared by install.sh --rollback and
+# scripts/remove.sh. Idempotent. They return 0 when the tool is gone, 1 for a name
+# they do not know, and 2 when something survived.
 
 # remove_source_build — build_from_source builds in place under $GITHUB_TOOL_DIR.
 remove_source_build() {
@@ -2663,10 +2662,10 @@ remove_snap_tool() {
     esac
     if snap_available && snap list "$snap_name" &>/dev/null; then
         snap remove "$snap_name" >> "$LOG_FILE" 2>&1 || true
-        snap list "$snap_name" &>/dev/null && return 1
+        snap list "$snap_name" &>/dev/null && return 2
     elif [[ "$snap_name" == "metasploit-framework" ]] && pkg_is_installed "$snap_name"; then
         pkg_remove "$snap_name" >> "$LOG_FILE" 2>&1 || true
-        pkg_is_installed "$snap_name" && return 1
+        pkg_is_installed "$snap_name" && return 2
     fi
     return 0
 }
@@ -2726,10 +2725,71 @@ remove_docker_tool() {
         IFS='|' read -r img lbl <<< "$entry"
         if [[ "$lbl" == "$label" || "${img%%:*}" == "$label" ]]; then
             docker rmi "$img" >> "$LOG_FILE" 2>&1 || true
+            docker image inspect "$img" >/dev/null 2>&1 && return 2
             return 0
         fi
     done
     return 1
+}
+
+# _record_release_version — a parallel child hands its version to the parent through the
+# vtag sidecar, as ordinary binaries do; recording it directly would leave the parent
+# writing "latest" over it and a second manifest row.
+_record_release_version() {
+    if [[ "${_PARALLEL_CHILD:-false}" == "true" ]]; then
+        echo "$3" > "$2/.$1.vtag"
+    else
+        track_version "$1" "binary" "$3"
+    fi
+}
+
+# _binary_release_entry — print the BINARY_RELEASES_* entry (repo|binary|pattern|dest|...) for a binary.
+_binary_release_entry() {
+    local _arr _entry _bin
+    for _arr in ${!BINARY_RELEASES_@}; do
+        declare -n _bre_ref="$_arr"
+        for _entry in "${_bre_ref[@]}"; do
+            IFS='|' read -r _ _bin _ <<< "$_entry"
+            if [[ "$_bin" == "$1" ]]; then
+                printf '%s\n' "$_entry"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# remove_binary_release — undo download_github_release: the PATH entry and version
+# sidecar, a .deb package, and a release directory no other recorded release shares.
+remove_binary_release() {
+    local binary="$1" entry pattern dest _arr _entry _other _odest _path _pkg
+    entry=$(_binary_release_entry "$binary") || return 1
+    IFS='|' read -r _ _ pattern dest _ <<< "$entry"
+    if [[ "$pattern" == *deb* ]] && command_exists dpkg; then
+        _path=$(command -v "$binary" 2>/dev/null) || _path="/usr/bin/$binary"
+        _pkg=$(dpkg -S "$_path" 2>/dev/null | head -1 | cut -d: -f1)
+        if [[ -n "$_pkg" ]]; then
+            maybe_sudo dpkg -r "$_pkg" >> "$LOG_FILE" 2>&1 || true
+            dpkg -s "$_pkg" 2>/dev/null | grep -q '^Status:.* installed' && return 2
+        fi
+    fi
+    rm -f "$PIPX_BIN_DIR/$binary" "$PIPX_BIN_DIR/.$binary.vtag" 2>/dev/null || true
+    [[ -e "$PIPX_BIN_DIR/$binary" ]] && return 2
+    if [[ -n "${dest:-}" && "$dest" != "$PIPX_BIN_DIR" && -d "$dest" ]]; then
+        for _arr in ${!BINARY_RELEASES_@}; do
+            declare -n _rbr_ref="$_arr"
+            for _entry in "${_rbr_ref[@]}"; do
+                IFS='|' read -r _ _other _ _odest _ <<< "$_entry"
+                # A shared directory (cybersec-jars) stays while another recorded release uses it.
+                if [[ "$_other" != "$binary" && "$_odest" == "$dest" ]] && _version_known "$_other"; then
+                    return 0
+                fi
+            done
+        done
+        rm -rf "${dest:?}" 2>/dev/null || true
+        [[ -e "$dest" ]] && return 2
+    fi
+    return 0
 }
 
 # Provenance filter

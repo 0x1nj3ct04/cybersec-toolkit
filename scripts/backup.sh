@@ -77,8 +77,7 @@ _init_backup_storage() {
     _BACKUP_STORAGE_READY=true
 }
 
-# _require_crypto_deps — fail before any work if encryption/verification tools are
-# missing, rather than after the archive is built ("Failed to generate MAC salt").
+# _require_crypto_deps — fail before any work when an encryption or verification tool is missing.
 _require_crypto_deps() {
     local _dep _missing=()
     for _dep in openssl python3 tar; do
@@ -169,15 +168,9 @@ encrypt_archive() {
     printf '%s' "$_PASSPHRASE" > "$pass_file"
     unset _PASSPHRASE
 
-    # Encrypt-then-MAC. ChaCha20 is an unauthenticated stream cipher, so the
-    # ciphertext is malleable and corruption/tampering would silently decrypt
-    # into garbage. We authenticate the ciphertext with HMAC-SHA256 (key
-    # derived from the passphrase via salted PBKDF2) and store the tag alongside;
-    # decryption verifies it first and fails closed on any mismatch.
-    #
-    # A per-backup random salt makes the .hmac sidecar useless as a cheap
-    # offline brute-force oracle: without an expensive salted KDF the tag would
-    # be ~PBKDF2_ITERATIONS× cheaper to attack than the ciphertext.
+    # Encrypt-then-MAC: ChaCha20 is malleable, so the ciphertext is authenticated with
+    # HMAC-SHA256 under a salted-PBKDF2 key; the per-backup salt keeps the .hmac sidecar
+    # from being a cheap offline brute-force oracle. Decryption verifies the tag first.
     local mac_salt
     mac_salt=$(openssl rand -hex 16)
     if [[ -z "$mac_salt" ]]; then
@@ -258,7 +251,7 @@ _ct_equal() {
 
 decrypt_archive() {
     local encrypted_path="$1"
-    local output_path="${2:-${encrypted_path%.enc}}"
+    local output_path="$2"
 
     [[ ! -e "$output_path" ]] || {
         log_error "Refusing to overwrite decrypted output: $output_path"
@@ -280,7 +273,6 @@ decrypt_archive() {
         if [[ -n "$mac_salt" && -n "$expected" ]]; then
             mac_format=v2
         else
-            # v1 legacy: single bare hex line, weak unsalted derivation
             log_warn "Legacy (unsalted) integrity tag detected — weak integrity, re-create this backup to upgrade"
             expected=$(tr -d '[:space:]' < "$hmac_file")
             mac_salt=""
@@ -327,8 +319,11 @@ decrypt_files_legacy() {
         local relative_path="${file#"$source_dir"/}"
         local decrypted_path="$target_dir/${relative_path%.enc}"
         ensure_dir "$(dirname "$decrypted_path")"
+        # The earliest legacy format used openssl's default PBKDF2 iteration count.
         if openssl enc -aes-256-cbc -d -pbkdf2 -iter "$PBKDF2_ITERATIONS" \
-            -in "$file" -out "$decrypted_path" -pass file:"$_PASS_FILE" 2>/dev/null; then
+            -in "$file" -out "$decrypted_path" -pass file:"$_PASS_FILE" 2>/dev/null \
+            || openssl enc -aes-256-cbc -d -pbkdf2 \
+                -in "$file" -out "$decrypted_path" -pass file:"$_PASS_FILE" 2>/dev/null; then
             log_success "Decrypted: $relative_path"
         else
             log_warn "Failed to decrypt: $relative_path"
@@ -358,7 +353,6 @@ backup_configs() {
         "web|$HOME_DIR/.wpscan"
         "web|$HOME_DIR/.mitmproxy"
         # Recon / OSINT (recon-ng keeps keys and workspaces in ~/.recon-ng)
-        "osint|$GITHUB_TOOL_DIR/recon-ng"
         "osint|$HOME_DIR/.recon-ng"
         "osint|$HOME_DIR/.config/subfinder"
         "osint|$HOME_DIR/.config/amass"
@@ -370,7 +364,6 @@ backup_configs() {
         "cracking|$HOME_DIR/.hashcat"
         # Exploitation
         "exploitation|$HOME_DIR/.msf4"
-        "exploitation|$GITHUB_TOOL_DIR/exploitdb"
         # Enterprise / AD
         "enterprise|$HOME_DIR/.netexec"
         # Forensics
@@ -466,7 +459,7 @@ _restore_tree() {
 # Restore config directories to their fixed destinations.
 restore_configs() {
     local src="$1"
-    local failed=0
+    local failed=0 restored=0
 
     # Home dir configs — restore to $HOME_DIR/
     local -a _home_dirs=(
@@ -478,8 +471,8 @@ restore_configs() {
     for dir in "${_home_dirs[@]}"; do
         local found
         found=$(find "$src" -maxdepth 2 -name "$dir" -type d 2>/dev/null | head -1)
-        if [[ -n "$found" ]] && ! _restore_tree "$found" "$HOME_DIR" "$dir"; then
-            failed=$((failed + 1))
+        if [[ -n "$found" ]]; then
+            if _restore_tree "$found" "$HOME_DIR" "$dir"; then restored=$((restored + 1)); else failed=$((failed + 1)); fi
         fi
     done
 
@@ -488,20 +481,15 @@ restore_configs() {
     for dir in "${_xdg_dirs[@]}"; do
         local found
         found=$(find "$src" -maxdepth 2 -name "$dir" -type d 2>/dev/null | head -1)
-        if [[ -n "$found" ]] \
-            && ! _restore_tree "$found" "$HOME_DIR/.config" ".config/$dir"; then
-            failed=$((failed + 1))
+        if [[ -n "$found" ]]; then
+            if _restore_tree "$found" "$HOME_DIR/.config" ".config/$dir"; then restored=$((restored + 1)); else failed=$((failed + 1)); fi
         fi
     done
 
-    # /opt tool dirs — restore to $GITHUB_TOOL_DIR/
-    for dir in exploitdb recon-ng; do
-        local found
-        found=$(find "$src" -maxdepth 2 -name "$dir" -type d 2>/dev/null | head -1)
-        if [[ -n "$found" ]] && ! _restore_tree "$found" "$GITHUB_TOOL_DIR" "$dir"; then
-            failed=$((failed + 1))
-        fi
-    done
+    if [[ "$restored" -eq 0 && "$failed" -eq 0 ]]; then
+        log_error "No configuration directories found in the backup"
+        return 1
+    fi
     [[ "$failed" -eq 0 ]]
 }
 
@@ -546,6 +534,24 @@ cmd_backup() {
     _chown_backup_dir || exit 1
 
     log_success "Backup created: $BACKUP_PATH.tar.gz.enc"
+    _prune_backups
+}
+
+# _prune_backups — with BACKUP_KEEP=N, keep only the N newest encrypted backups.
+_prune_backups() {
+    [[ "${BACKUP_KEEP:-}" =~ ^[1-9][0-9]*$ ]] || return 0
+    local -a archives=()
+    local f
+    # Names embed a sortable timestamp (backup_YYYYMMDD_HHMMSS), so glob order is age order.
+    for f in "$BACKUP_DIR"/backup_*.tar.gz.enc; do
+        [[ -f "$f" ]] && archives+=("$f")
+    done
+    local excess=$(( ${#archives[@]} - BACKUP_KEEP ))
+    local i
+    for (( i = 0; i < excess; i++ )); do
+        rm -f -- "${archives[$i]}" "${archives[$i]}.hmac"
+        log_info "Pruned old backup: ${archives[$i]}"
+    done
 }
 
 cmd_restore() {
@@ -672,11 +678,16 @@ cmd_restore() {
         exit 1
     fi
 
-    # Legacy format: individually encrypted files. Search the whole backup root —
-    # old backups did not always keep them under encrypted/.
-    if find "$restore_root" -name "*.enc" -print -quit 2>/dev/null | grep -q .; then
+    # Legacy format: individually encrypted files inside a plain .tar.gz. Search the
+    # whole backup root — old backups did not always keep them under encrypted/.
+    # A current .tar.gz.enc archive is encrypted whole; *.enc inside it are user files.
+    if [[ "$backup_file" != *.tar.gz.enc ]] \
+        && find "$restore_root" -name "*.enc" -print -quit 2>/dev/null | grep -q .; then
         log_info "Legacy encrypted files found — decrypting..."
-        decrypt_files_legacy "$restore_root" "$restore_root" || {
+        # Legacy archives kept them under encrypted/<category>/<dir>/, mirroring the plain layout.
+        _legacy_src="$restore_root"
+        [[ -d "$restore_root/encrypted" ]] && _legacy_src="$restore_root/encrypted"
+        decrypt_files_legacy "$_legacy_src" "$restore_root" || {
             log_error "One or more legacy files could not be decrypted"
             exit 1
         }
@@ -700,7 +711,9 @@ cmd_list() {
         echo "  $f"
         found=true
     done
-    [[ "$found" == "false" ]] && echo "  No backups found"
+    if [[ "$found" == "false" ]]; then
+        echo "  No backups found"
+    fi
 }
 
 cmd_delete() {
@@ -786,13 +799,11 @@ cmd_schedule() {
     local frequency="$1"
     local time="$2"
 
-    # Validate HH:MM format
     if [[ ! "$time" =~ ^[0-9]{1,2}:[0-9]{2}$ ]]; then
         log_error "Invalid time format. Use HH:MM (e.g., 02:00)"
         exit 1
     fi
 
-    # Parse HH:MM
     local hour minute
     hour=$(echo "$time" | cut -d: -f1)
     minute=$(echo "$time" | cut -d: -f2)
@@ -864,6 +875,12 @@ cmd_schedule() {
 
     if ! printf "BACKUP_PASSPHRASE='%s'\n" "$_escaped" > "$tmp_env"; then
         log_error "Failed to write passphrase to $tmp_env"
+        rm -f "$tmp_env"
+        exit 1
+    fi
+
+    if [[ "${BACKUP_KEEP:-}" =~ ^[1-9][0-9]*$ ]] && ! printf "export BACKUP_KEEP='%s'\n" "$BACKUP_KEEP" >> "$tmp_env"; then
+        log_error "Failed to write BACKUP_KEEP to $tmp_env"
         rm -f "$tmp_env"
         exit 1
     fi
@@ -957,6 +974,8 @@ Environment:
   BACKUP_ALLOW_UNVERIFIED=1        Restore a legacy backup that has no integrity
                                    tag (.tar.gz, or .enc without .hmac); refused
                                    otherwise
+  BACKUP_KEEP=N                    Keep only the N newest backups after each backup
+                                   (set it when scheduling to apply to cron runs)
 
 Options:
   -h, --help                       Show this help and exit

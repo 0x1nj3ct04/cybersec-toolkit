@@ -107,7 +107,11 @@ _run_guard_on() {
         '/usr/bin/nmap 192.0.2.10' \
         $'cat > f <<\'EOF\'\nhello\nEOF\nnmap 192.0.2.10' \
         $'echo "<<EOF"\nnmap 192.0.2.10' \
-        $'x=$((a << b))\nnmap 192.0.2.10'; do
+        $'x=$((a << b))\nnmap 192.0.2.10' \
+        'timeout 300 nmap 192.0.2.10' \
+        'nice -n 10 nmap 192.0.2.10' \
+        'echo 192.0.2.10 | xargs nmap' \
+        'bash -c "nmap 192.0.2.10"'; do
         _run_guard_on "$cmd"
         assert_success
         assert_output --partial '"permissionDecision":"deny"'
@@ -405,6 +409,32 @@ PY
     assert_output 'Indexed tool arrays retained; associative metadata excluded'
 }
 
+@test "skill frontmatter reader keeps multi-line and quoted values whole" {
+    run python3 - "$PROJECT_ROOT" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1] + '/scripts')
+from _skill_frontmatter import frontmatter
+text = """---
+name: sample
+description: First line
+  continues here: with a colon
+quoted: 'It''s
+  two lines
+
+  '
+---
+body
+"""
+fm = frontmatter(text)
+assert fm["description"] == "First line continues here: with a colon", fm
+assert fm["quoted"] == "It's two lines", fm
+assert set(fm) == {"name", "description", "quoted"}, fm
+print("ok")
+PY
+    assert_success
+    assert_output "ok"
+}
+
 @test "source module removal clears all mapped executables" {
     _lifecycle_fixture
     _source_fixture_module "$LC_REPO"
@@ -683,6 +713,35 @@ _run_backup_schedule() {
     assert_output "pkg uninstall -y dnsenum"
 }
 
+@test "remove --module drops the rows of what it removed" {
+    _lifecycle_fixture
+    printf 'jwt_tool|git|HEAD|2026-01-01 00:00:00\nnmap|pkg|system|2026-01-01 00:00:00\n' >> "$LC_REPO/.versions"
+    mkdir -p "$TEST_TMPDIR/tools/jwt_tool"
+
+    _run_lifecycle remove.sh --module web --yes
+
+    assert_success
+    [[ ! -e "$TEST_TMPDIR/tools/jwt_tool" ]]
+    ! grep -q '^jwt_tool|' "$LC_REPO/.versions" || false
+    grep -q '^nmap|' "$LC_REPO/.versions"
+}
+
+@test "remove keeps the install record when a special tool survives" {
+    [[ "$(id -u)" -ne 0 ]] || skip "root ignores the read-only directory"
+    _lifecycle_fixture
+    mkdir -p "$TEST_TMPDIR/home/.foundry/bin"
+    printf '#!/bin/sh\n' > "$TEST_TMPDIR/home/.foundry/bin/forge"
+    chmod 555 "$TEST_TMPDIR/home/.foundry"
+    printf 'foundry|special|latest|2026-01-01 00:00:00\n' >> "$LC_REPO/.versions"
+
+    _run_lifecycle remove.sh --yes
+
+    chmod 755 "$TEST_TMPDIR/home/.foundry"
+    assert_failure
+    assert_output --partial "Failed to remove Foundry"
+    [[ -f "$LC_REPO/.versions" ]]
+}
+
 @test "remove drops a cloned repo's PATH wrapper and multi-field release dirs" {
     _lifecycle_fixture
     printf 'nikto|git|HEAD|2026-01-01 00:00:00\nmemprocfs|binary|v1|2026-01-01 00:00:00\n' \
@@ -711,6 +770,17 @@ _run_backup_schedule() {
 
     assert_success
     refute_output --partial "chisel (foundry)"
+}
+
+@test "verify --installed-only checks tracked packages whose command differs" {
+    _lifecycle_fixture
+    printf 'snmp|apt|system|2026-01-01 00:00:00\nnetcat-openbsd|apt|system|2026-01-01 00:00:00\n' \
+        >> "$LC_REPO/.versions"
+
+    _run_verify_linux --installed-only --module networking
+
+    assert_output --partial "snmp —"
+    assert_output --partial "netcat-openbsd —"
 }
 
 @test "update rebuilds pulled build trees and skips same-named user repos" {
@@ -744,6 +814,23 @@ _run_backup_schedule() {
     [[ "$(cat "$TEST_TMPDIR/tools/massdns/bin/massdns")" == "v2" ]]
     [[ "$(cat "$TEST_TMPDIR/tools/AFLplusplus/built.txt")" == "v2" ]]
     [[ "$(git -C "$TEST_TMPDIR/tools/codext" log -1 --format=%s)" == "local" ]]
+}
+
+@test "update rebuilds only Go tools the toolkit installed" {
+    _lifecycle_fixture
+    printf '#!/bin/sh\necho "go $*" >> "%s/calls.log"\n[ "$1" = version ] && echo "go version go1.23.0 linux/amd64"\nexit 0\n' \
+        "$TEST_TMPDIR" > "$LC_STUBS/go"
+    printf '#!/bin/sh\n' > "$TEST_TMPDIR/prefix/bin/ffuf"
+    printf '#!/bin/sh\n' > "$TEST_TMPDIR/prefix/bin/gf"
+    chmod +x "$TEST_TMPDIR/prefix/bin/ffuf" "$TEST_TMPDIR/prefix/bin/gf"
+    printf 'gf|go|latest|2026-01-01 00:00:00\n' >> "$LC_REPO/.versions"
+
+    _run_lifecycle update.sh --skip-system --skip-pipx --skip-git --skip-gems \
+        --skip-cargo --skip-binary --skip-special --skip-docker
+
+    run grep -F "go install" "$TEST_TMPDIR/calls.log"
+    assert_output --partial "github.com/tomnomnom/gf@latest"
+    refute_output --partial "ffuf"
 }
 
 @test "mcp-launch.sh --local runs uv on the host, not the sandbox" {
@@ -808,7 +895,7 @@ EOF
 
 @test "remove refuses to run non-interactively without --yes" {
     _lifecycle_fixture
-    # Without a terminal a "cancel" used to exit 0 (silent success in CI/cron).
+    # Without a terminal, cancelling must exit non-zero so CI and cron cannot read it as success.
     run env -i HOME="$TEST_TMPDIR/home" PREFIX="$TEST_TMPDIR/prefix" TERMUX_VERSION=1 \
         PKG_MANAGER=pkg DISTRO_ID=android DISTRO_ID_LIKE= DISTRO_NAME=Termux \
         GITHUB_TOOL_DIR="$TEST_TMPDIR/tools" TMPDIR="$TEST_TMPDIR" TERM=dumb \
@@ -873,6 +960,42 @@ EOF
     [[ -f "$test_home/.nmap/settings" ]]
 }
 
+@test "backup with BACKUP_KEEP prunes the oldest archives" {
+    local test_home="$TEST_TMPDIR/home" store="$TEST_TMPDIR/home/cybersec_tools_backup"
+    mkdir -p "$test_home/.nmap" "$store"
+    chmod 700 "$store"
+    printf 'setting\n' > "$test_home/.nmap/settings"
+    touch "$store/backup_20200101_000000.tar.gz.enc" "$store/backup_20200101_000000.tar.gz.enc.hmac" \
+        "$store/backup_20200102_000000.tar.gz.enc"
+
+    run env -u SUDO_USER HOME="$test_home" PREFIX="$TEST_TMPDIR/prefix" TERMUX_VERSION=1 \
+        BACKUP_PASSPHRASE="test-only-passphrase" BACKUP_KEEP=2 \
+        bash "$PROJECT_ROOT/scripts/backup.sh" backup
+
+    assert_success
+    [[ ! -e "$store/backup_20200101_000000.tar.gz.enc" && ! -e "$store/backup_20200101_000000.tar.gz.enc.hmac" ]]
+    [[ -e "$store/backup_20200102_000000.tar.gz.enc" ]]
+    [[ "$(find "$store" -name 'backup_*.tar.gz.enc' | wc -l)" -eq 2 ]]
+}
+
+@test "restore keeps user files named *.enc in a current-format backup" {
+    local test_home="$TEST_TMPDIR/home"
+    mkdir -p "$test_home/.msf4/loot"
+    printf 'loot\n' > "$test_home/.msf4/loot/capture.enc"
+    run env -u SUDO_USER HOME="$test_home" PREFIX="$TEST_TMPDIR/prefix" TERMUX_VERSION=1 \
+        BACKUP_PASSPHRASE="test-only-passphrase" \
+        bash "$PROJECT_ROOT/scripts/backup.sh" backup
+    assert_success
+
+    local -a encrypted=("$test_home"/cybersec_tools_backup/backup_*.tar.gz.enc)
+    rm -rf "$test_home/.msf4"
+    run env -u SUDO_USER HOME="$test_home" PREFIX="$TEST_TMPDIR/prefix" TERMUX_VERSION=1 \
+        BACKUP_PASSPHRASE="test-only-passphrase" \
+        bash "$PROJECT_ROOT/scripts/backup.sh" restore "${encrypted[0]}" < /dev/null
+    assert_success
+    [[ "$(cat "$test_home/.msf4/loot/capture.enc")" == "loot" ]]
+}
+
 @test "a second install/update/remove run refuses while one holds the lock (OP-4)" {
     command -v flock >/dev/null || skip "needs flock"
     _lifecycle_fixture
@@ -891,6 +1014,49 @@ EOF
     wait "$holder" 2>/dev/null || true
     assert_failure
     assert_output --partial "Another install, update or remove run is active"
+}
+
+@test "an install refused by the run lock keeps the active run's log" {
+    command -v flock >/dev/null || skip "needs flock"
+    _lifecycle_fixture
+    cp "$PROJECT_ROOT/install.sh" "$PROJECT_ROOT/VERSION" "$LC_REPO/"
+    cp -R "$PROJECT_ROOT/profiles" "$LC_REPO/"
+    printf 'line1\nline2\nline3\n' > "$LC_REPO/cybersec_install.log"
+    flock "$LC_REPO/.versions.run.lock" sleep 30 &
+    local holder=$!
+    local i
+    for i in $(seq 1 30); do
+        flock -n "$LC_REPO/.versions.run.lock" true 2>/dev/null || break
+        sleep 0.1
+    done
+
+    run env -i HOME="$TEST_TMPDIR/home" PREFIX="$TEST_TMPDIR/prefix" TERMUX_VERSION=1 \
+        PKG_MANAGER=pkg DISTRO_ID=android DISTRO_ID_LIKE= DISTRO_NAME=Termux TERM=dumb \
+        TMPDIR="$TEST_TMPDIR" PATH="$LC_STUBS:$PATH" bash "$LC_REPO/install.sh" --tool nmap
+
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    assert_failure
+    assert_output --partial "Another install, update or remove run is active"
+    [[ "$(wc -l < "$LC_REPO/cybersec_install.log")" -eq 3 ]]
+}
+
+@test "restore decrypts a legacy per-file archive into place" {
+    local test_home="$TEST_TMPDIR/home"
+    local src="$TEST_TMPDIR/archive-src/backup_fixture"
+    local archive="$TEST_TMPDIR/legacy.tar.gz"
+    mkdir -p "$test_home" "$src/encrypted/network/.nmap"
+    printf 'test-only-passphrase' > "$TEST_TMPDIR/pass"
+    printf 'setting\n' | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 600000 \
+        -out "$src/encrypted/network/.nmap/nmap.conf.enc" -pass file:"$TEST_TMPDIR/pass"
+    tar -czf "$archive" -C "$TEST_TMPDIR/archive-src" backup_fixture
+
+    run env -u SUDO_USER HOME="$test_home" PREFIX="$TEST_TMPDIR/prefix" TERMUX_VERSION=1 \
+        BACKUP_ALLOW_UNVERIFIED=1 BACKUP_PASSPHRASE="test-only-passphrase" \
+        bash "$PROJECT_ROOT/scripts/backup.sh" restore "$archive" < /dev/null
+
+    assert_success
+    [[ "$(cat "$test_home/.nmap/nmap.conf")" == "setting" ]]
 }
 
 @test "restore refuses an unauthenticated legacy archive by default (SI-12)" {
@@ -968,6 +1134,22 @@ EOF
     assert_success
     [[ ! -e "$XDG_STATE_HOME/cybersec-tools-mcp/guard-session.../escape" ]]
     [[ ! -e "$XDG_STATE_HOME/escape" ]]
+}
+
+@test "agent guard keeps a session's clearance across compaction" {
+    _guard_fixture
+    local dir="$XDG_STATE_HOME/cybersec-tools-mcp"
+    printf '2026-07-28T10:00:00.000Z\n' > "$dir/guard-session.sessA"
+    printf '%s\n' '{"ts":"2026-07-28T10:00:05.000Z","event":"tool_call","tool":"guided_assessment"}' \
+        > "$CYBERSEC_MCP_AUDIT_LOG"
+
+    run env -u CYBERSEC_AGENT_GUARD XDG_STATE_HOME="$XDG_STATE_HOME" \
+        bash "$PROJECT_ROOT/scripts/agent-guard.sh" session-start <<< '{"session_id":"sessA","source":"compact"}'
+    assert_success
+    run env -u CYBERSEC_AGENT_GUARD XDG_STATE_HOME="$XDG_STATE_HOME" CYBERSEC_MCP_AUDIT_LOG="$CYBERSEC_MCP_AUDIT_LOG" \
+        bash "$PROJECT_ROOT/scripts/agent-guard.sh" pre-bash \
+        <<< '{"session_id":"sessA","tool_input":{"command":"nmap 192.0.2.10"}}'
+    refute_output --partial '"permissionDecision":"deny"'
 }
 
 _source_fixture_module() {

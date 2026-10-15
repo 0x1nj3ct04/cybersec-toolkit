@@ -33,7 +33,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
         with:
           egress-policy: audit
 
@@ -66,7 +66,8 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
-            type=sha,format=short
+            # Tag builds rebuild the same commit; a second sha- tag would point at a different image.
+            type=sha,format=short,enable=${{ github.ref_type == 'branch' }}
 
       - name: Build image (load locally for scanning)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -85,6 +86,18 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+
+      # The MCP Registry launches the image with server.json's arguments; prove that exact
+      # command answers an MCP initialize before anything is pushed.
+      - name: Answer MCP initialize with the registry launch command
+        env:
+          IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: |
+          mapfile -t runtime_args < <(jq -r '.packages[0].runtimeArguments[] | .name, .value' server.json)
+          mapfile -t package_args < <(jq -r '.packages[0].packageArguments[] | .value' server.json)
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | timeout 120 docker run --rm -i "${runtime_args[@]}" "$IMAGE" "${package_args[@]}" \
+            | grep -q '"serverInfo"'
 
       # Logged in only for the push: the build and the scanner never see the credential.
       - name: Log in to GHCR

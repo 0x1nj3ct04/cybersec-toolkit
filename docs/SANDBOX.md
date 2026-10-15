@@ -114,8 +114,7 @@ These are limitations of that nesting layer, not of Kata. On macOS, prefer `--lo
    minimal tool set; to bake in a full profile, pass it as a build argument:
 
    ```bash
-   docker build -f sandbox/Dockerfile --build-arg TOOLKIT_PROFILE=ctf \
-       -t cybersec-toolkit-sandbox:latest .
+   make sandbox-image TOOLKIT_PROFILE=ctf
    ```
 
 4. Install the launcher's Node dependencies:
@@ -170,11 +169,12 @@ to `kata()`.
 | `CYBERSEC_SANDBOX_MEMORY` | `2g` | Guest memory. |
 | `CYBERSEC_SANDBOX_CPUS` | `2` | Guest vCPUs. |
 | `CYBERSEC_SANDBOX_PIDS_LIMIT` | `512` | Process limit inside the guest. |
+| `CYBERSEC_SANDBOX_SCRATCH_SIZE` | `1g` | Size cap of each writable tmpfs (`/tmp`, `/var/tmp`, `$HOME`, the audit log dir, and `/workspace` when none is mounted). |
 | `CYBERSEC_SANDBOX_USER` | `10001:10001` | Guest uid:gid; must match the image. |
-| `CYBERSEC_SANDBOX_CAP_ADD` | none | Comma-separated capabilities, e.g. `NET_RAW` for `nmap -sS`. |
+| `CYBERSEC_SANDBOX_CAP_ADD` | none | Comma-separated capabilities added to the container. The guest user is unprivileged and `no-new-privileges` is set, so they stay in the bounding set and do not enable raw sockets for it. |
 
-`CYBERSEC_MCP_ALLOW_EXTERNAL` and `CYBERSEC_MCP_ALLOW_SCRIPTS` are forwarded
-into the VM. Host-specific paths such as `CYBERSEC_MCP_AUDIT_LOG` and
+`CYBERSEC_MCP_ALLOW_EXTERNAL`, `CYBERSEC_MCP_ALLOW_SCRIPTS` and
+`CYBERSEC_MCP_REDACT_OUTPUT` are forwarded into the VM. Host-specific paths such as `CYBERSEC_MCP_AUDIT_LOG` and
 `CYBERSEC_MCP_VENVS_DIR` are not: they are baked into the image and must keep
 pointing at guest paths. `CYBERSEC_MCP_AUDIT_LOG` still applies on the host, where
 it names the file the mirrored records are appended to.
@@ -320,7 +320,8 @@ python3 scripts/verify_audit_chain.py path/to.log   # or a specific one
 The chain survives the trip out of the VM because the host appends the guest's
 lines verbatim; the tag is checked on the way in and not stored. Three limits are
 inherent and worth stating: records written before this existed are reported as
-unchained rather than flagged, dropping a chain's last records or a whole chain
+unchained rather than flagged (one without chain fields after chained records is
+flagged), dropping a chain's last records or a whole chain
 leaves no link to break, and because the chain is unkeyed, someone who can
 read and write the host log can still append a well-formed record. The session
 key keeps forged records from arriving through the VM; the chain detects
@@ -329,14 +330,17 @@ modification and deletion, not forgery by someone with access to the file.
 ## Hardening applied to each VM
 
 `--cap-drop ALL`, `--security-opt no-new-privileges`, a non-root guest user
-(`10001:10001`), `--pids-limit`, and memory/CPU caps. The image drops setuid
+(`10001:10001`), `--pids-limit`, memory/CPU caps, and a read-only root filesystem
+whose only writable paths are size-capped tmpfs mounts, so an unpacked sample
+cannot fill the host's Docker storage. The image drops setuid
 and setgid bits and ships no `sudo`. The container is created with `--rm` and
 labelled `cybersec-toolkit.sandbox=kata`.
 
 Two consequences worth knowing:
 
-- Raw-socket scans (`nmap -sS`, `-sU`, OS detection) need
-  `CYBERSEC_SANDBOX_CAP_ADD=NET_RAW`. Without it, connect scans still work.
+- Raw-socket scans (`nmap -sS`, `-sU`, OS detection) do not work in the sandbox:
+  the unprivileged guest user never gets an added `NET_RAW` as an effective
+  capability. Connect scans (`-sT`) work; use `--local` for raw-socket scans.
 - The guest filesystem is discarded on teardown. Anything worth keeping must be
   written to `/workspace` or copied out before the client disconnects.
 

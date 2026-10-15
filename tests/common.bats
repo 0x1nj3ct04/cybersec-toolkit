@@ -614,42 +614,6 @@ _bc_setup() {
     [[ "$PATH" == "/usr/bin:/home/u/.local/bin:/home/u/.cargo/bin" ]]
 }
 
-# Dead = gone, or a zombie awaiting reap by its parent.
-_pid_dead() {
-    local line
-    read -r line < "/proc/$1/stat" 2>/dev/null || return 0
-    line="${line##*) }"
-    [[ "${line%% *}" == [ZX] ]]
-}
-
-@test "_kill_tree stops descendants that ignore SIGINT (Ctrl+C orphan case)" {
-    [[ -d /proc/self ]] || skip "needs /proc"
-    source_libs debian apt
-    # Like Stage 3: a background parent whose own background children ignore SIGINT.
-    bash -c 'trap "" INT; sleep 30 & sleep 30 & wait' &
-    local parent=$!
-    local kids="" i
-    for i in $(seq 1 30); do
-        kids=$(_child_pids "$parent")
-        [[ $(wc -w <<<"$kids") -ge 2 ]] && break
-        sleep 0.1
-    done
-    [[ $(wc -w <<<"$kids") -ge 2 ]]
-
-    _kill_tree "$parent" TERM
-    kill -TERM "$parent" 2>/dev/null || true
-
-    local k alive
-    for i in $(seq 1 30); do
-        alive=0
-        for k in $kids; do _pid_dead "$k" || alive=1; done
-        [[ $alive -eq 0 ]] && break
-        sleep 0.1
-    done
-    wait "$parent" 2>/dev/null || true
-    [[ $alive -eq 0 ]]
-}
-
 @test "run lock preserves the caller's stderr" {
     bats_require_minimum_version 1.5.0
     command -v flock >/dev/null || skip "needs flock"
@@ -782,4 +746,59 @@ PY
     assert_success
     run cat "$CALLS_FILE"
     assert_output "zypper --non-interactive refresh --force"
+}
+
+@test "git_clone_or_pull leaves an existing non-git directory alone" {
+    make_test_tmpdir
+    local dest="$TEST_TMPDIR/opt/tool"
+    mkdir -p "$dest"
+    printf 'mine\n' > "$dest/notes.txt"
+    export SUDO_USER=builder
+    chown() { echo "chown $*" >> "$TEST_TMPDIR/calls.log"; }
+    _as_builder() { echo "as_builder $*" >> "$TEST_TMPDIR/calls.log"; return 1; }
+
+    run git_clone_or_pull "https://internal.example/tool.git" "$dest"
+
+    assert_failure
+    [[ ! -e "$TEST_TMPDIR/calls.log" ]]
+    [[ -f "$dest/notes.txt" ]]
+}
+
+@test "strict mode refuses an unsigned bootstrap only when it would run as root" {
+    REQUIRE_CHECKSUMS=true PKG_MANAGER=apt SUDO_USER="" run _strict_refuses_root_bootstrap rustup
+    assert_success
+    assert_output --partial "Skipping rustup in strict mode"
+    REQUIRE_CHECKSUMS=true PKG_MANAGER=apt SUDO_USER=builder run _strict_refuses_root_bootstrap rustup
+    assert_failure
+    REQUIRE_CHECKSUMS=false PKG_MANAGER=apt SUDO_USER="" run _strict_refuses_root_bootstrap rustup
+    assert_failure
+}
+
+@test "pkg_remove refuses a removal that would take dependent packages along" {
+    make_test_tmpdir
+    apt-get() {
+        if [[ "$1" == -s ]]; then
+            printf 'Remv nodejs [20.1]\nRemv user-app [1.0]\n'
+        else
+            echo "apt-get $*" >> "$TEST_TMPDIR/calls"
+        fi
+    }
+    maybe_sudo() { env "$@" 2>/dev/null || "$@"; }
+    PKG_MANAGER=apt
+
+    run pkg_remove nodejs
+    assert_failure
+    assert_output --partial "user-app"
+    [[ ! -e "$TEST_TMPDIR/calls" ]]
+}
+
+@test "the install log never writes through a planted symlink" {
+    make_test_tmpdir
+    printf 'keep\n' > "$TEST_TMPDIR/victim"
+    ln -s "$TEST_TMPDIR/victim" "$TEST_TMPDIR/cybersec_install.log"
+
+    _init_log_file "$TEST_TMPDIR/cybersec_install.log"
+
+    [[ "$(cat "$TEST_TMPDIR/victim")" == "keep" ]]
+    [[ ! -L "$TEST_TMPDIR/cybersec_install.log" ]]
 }

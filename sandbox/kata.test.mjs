@@ -83,6 +83,13 @@ test('resolveOptions keeps the unsafe-runtime opt-in off unless set to 1', () =>
   assert.equal(resolveOptions({}, { CYBERSEC_SANDBOX_ALLOW_UNSAFE_RUNTIME: '1' }).allowUnsafeRuntime, true);
 });
 
+test('resolveOptions mounts the workspace read-only for any true spelling', () => {
+  assert.equal(resolveOptions({ workspaceReadonly: true }, {}).workspaceReadonly, true);
+  assert.equal(resolveOptions({}, { CYBERSEC_SANDBOX_WORKSPACE_RO: 'true' }).workspaceReadonly, true);
+  assert.equal(resolveOptions({}, { CYBERSEC_SANDBOX_WORKSPACE_RO: '1' }).workspaceReadonly, true);
+  assert.equal(resolveOptions({}, {}).workspaceReadonly, false);
+});
+
 test('selectRuntime fails closed when no kata runtime is registered', () => {
   assert.throws(() => selectRuntime({ runc: {}, 'io.containerd.runc.v2': {} }), /No Kata runtime/);
   assert.throws(() => selectRuntime({}), /docs\/SANDBOX\.md/);
@@ -126,6 +133,9 @@ test('assertWorkspaceUsable refuses the host root, including through a symlink',
 test('assertWorkspaceUsable refuses system trees, $HOME and the checkout', () => {
   assert.throws(() => assertWorkspaceUsable('/etc'), /system directory/);
   assert.throws(() => assertWorkspaceUsable('/usr'), /system directory/);
+  // Parents of Docker/Kata state would expose the runtime itself to the guest.
+  assert.throws(() => assertWorkspaceUsable('/var'), /system directory/);
+  assert.throws(() => assertWorkspaceUsable('/run'), /system directory/);
   assert.throws(() => assertWorkspaceUsable(homedir()), /home directory/);
   assert.throws(() => assertWorkspaceUsable(resolve(import.meta.dirname, '..')), /checkout/);
   // A dedicated directory outside those trees is fine.
@@ -182,7 +192,18 @@ test('buildRunArgs forwards the MCP policy environment into the VM', () => {
   });
   // Names only; values must not appear on the docker command line.
   assert.deepEqual(flagValues(args, '--env'), ['CYBERSEC_MCP_ALLOW_EXTERNAL', 'CYBERSEC_MCP_ALLOW_SCRIPTS']);
-  assert.equal(args.some((a) => a.includes('=0')), false);
+  assert.equal(args.some((a) => /^CYBERSEC_MCP_[A-Z_]+=/.test(a)), false);
+});
+
+test('buildRunArgs makes the root read-only and caps every writable path', () => {
+  const tmpfs = (options) => flagValues(buildRunArgs({ name: 'sbx', runtime: 'kata', options, env: {} }), '--tmpfs');
+  const args = buildRunArgs({ name: 'sbx', runtime: 'kata', options: baseOptions(), env: {} });
+  assert.ok(args.includes('--read-only'));
+  const scratch = tmpfs(baseOptions({ scratchSize: '256m' }));
+  assert.deepEqual(scratch.map((s) => s.split(':')[0]), ['/tmp', '/var/tmp', '/home/toolkit', '/var/log/cybersec', WORKTREE_PATH]);
+  assert.ok(scratch.every((s) => s.includes('size=256m') && s.includes('uid=10001')));
+  // A mounted workspace is the operator's directory, not scratch space.
+  assert.equal(tmpfs(baseOptions({ workspace: '/srv/case' })).some((s) => s.startsWith(`${WORKTREE_PATH}:`)), false);
 });
 
 test('buildRunArgs adds requested capabilities and a network only when set', () => {

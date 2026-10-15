@@ -135,14 +135,14 @@ _SCRIPT_SENSITIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(
             r"""
             (
-                (?:\b|['"])                                 # word or quoted key
+                (?:(?<![a-z0-9])|['"])                      # key start, incl. DB_PASSWORD / ?access_token
                 (?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|
                    auth[_-]?token|bearer[_-]?token|client[_-]?secret|
                    session[_-]?id|session[_-]?token|private[_-]?key|
                    aws[_-]?secret[_-]?access[_-]?key|aws[_-]?access[_-]?key[_-]?id|
                    github[_-]?token|openai[_-]?api[_-]?key|
                    token|passwd|passphrase|password|secret)
-                ['"]?                                       # optional close quote on key
+                ['"]?\]?                                    # optional close quote / subscript bracket
                 \s*[:=]\s*                                  # assignment
             )
             (?!\[REDACTED\])                                # don't re-match a prior redaction
@@ -314,7 +314,12 @@ class _SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):
             super().emit(record)
             return
         with lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            except OSError:
+                # Filesystems without flock (some network mounts): write unlocked, never drop.
+                super().emit(record)
+                return
             try:
                 if self.stream is not None:
                     try:
@@ -419,9 +424,28 @@ def chain_link(previous: str, line: str) -> str:
     return hashlib.sha256(f"{previous}{line}".encode()).hexdigest()
 
 
+# Free-form values (tool args, error text) are capped so a record stays far below the
+# sandbox sink's 1 MiB line limit; the SHA256 still correlates the full value.
+_MAX_FIELD_CHARS = 8192
+
+
+def _bound_strings(value: Any) -> Any:
+    if isinstance(value, str):
+        if len(value) <= _MAX_FIELD_CHARS:
+            return value
+        digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+        return f"{value[:1024]} [TRUNCATED {len(value)} chars sha256={digest}]"
+    if isinstance(value, dict):
+        return {key: _bound_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_bound_strings(item) for item in value]
+    return value
+
+
 def _log(level: int, entry: dict[str, Any]) -> None:
     """Write a JSON audit entry; fail only when required audit setup fails."""
     global _chain_prev, _chain_seq
+    entry = _bound_strings(entry)
     try:
         # The lock keeps the emitted order and the chain order identical.
         with _chain_lock:

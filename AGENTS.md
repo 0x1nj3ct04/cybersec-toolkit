@@ -163,8 +163,8 @@ git submodule update --init --recursive
 ```
 
 Test files: `tests/common.bats`, `tests/install.bats`, `tests/installers.bats`,
-`tests/modules.bats`, `tests/profiles.bats`, `tests/scripts.bats`. Helper at
-`tests/test_helper.bash`.
+`tests/modules.bats`, `tests/profiles.bats`, `tests/runtime_launcher.bats`,
+`tests/scripts.bats`. Helper at `tests/test_helper.bash`.
 
 ### MCP Server
 
@@ -173,7 +173,7 @@ Test files: `tests/common.bats`, `tests/install.bats`, `tests/installers.bats`,
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Interactive MCP Inspector (web UI)
-cd mcp_server && uv run fastmcp dev server.py
+cd mcp_server && uv run fastmcp dev inspector server.py
 
 # CLI entrypoint
 cd mcp_server && uv run cybersec-mcp
@@ -217,8 +217,9 @@ such as `curl` remain normal `run_tool` calls.
 
 ### MCP environment variables
 
-- `CYBERSEC_MCP_ALLOW_SCRIPTS=1` — enables unsandboxed Python/Bash execution with
-  the MCP process user's filesystem and network permissions
+- `CYBERSEC_MCP_ALLOW_SCRIPTS=1` — enables Python/Bash execution outside the policy
+  layer, with the MCP process user's filesystem and network permissions (inside the
+  Kata VM by default, on the host with `--local`)
 - `CYBERSEC_MCP_ALLOW_EXTERNAL=0` — safest default; governed network tools and
   SSH remotes reject direct targets outside private/loopback ranges. This is a
   preflight policy, not a network sandbox: DNS can change after validation and
@@ -281,7 +282,7 @@ Separate Python package (FastMCP), managed with `uv` (`pyproject.toml`), not pip
 - `cve_advisor.py` — CVE → curated skills/tools/modules mapping + live NVD/KEV/EPSS lookup commands (local-first)
 - `guided_assessment.py` — companion-first target/finding classification, triage/report
   routing, tool selection, and opt-in autonomous solving. Autonomous mode uses governed
-  `run_tool`/`run_pipeline` calls and may use the separately enabled, unsandboxed
+  `run_tool`/`run_pipeline` calls and may use the separately enabled, policy-free
   `run_script` capability for scoped helpers; scripts must not bypass authorization,
   scope, or policy decisions
 - `security.py` — execution engine + policy enforcement + argument sanitization
@@ -296,12 +297,13 @@ Separate Python package (FastMCP), managed with `uv` (`pyproject.toml`), not pip
 
 Key design decisions: absolute imports with `sys.path` fixup (no relative imports);
 `TOOL_ALIASES` in `advisor_utils.py` maps friendly names to registry names; Termux-aware
-(omits `sudo` when `TERMUX_VERSION` is set); all subprocess code uses
+(omits `sudo` when `TERMUX_VERSION` is set); all tool-execution subprocess code uses
 `create_subprocess_exec` (no `shell=True`) and `_bounded_communicate()` (not
 `communicate()`).
 
 **Hardcoded data that must stay in sync with bash sources** (validated by
-`scripts/validate_mcp_sync.py`): `tools_db.py` `PIPX_BIN_NAMES` ↔ `scripts/verify.sh`;
+`scripts/validate_mcp_sync.py`, which also covers the C2, CVE, binary-name, toolchain
+and audit-stream constants), including: `tools_db.py` `PIPX_BIN_NAMES` ↔ `scripts/verify.sh`;
 `tools_db.py` `MODULE_DESCRIPTIONS` ↔ `lib/common.sh`; `tools_db.py` `DOCKER_IMAGES` ↔
 `lib/installers.sh` `ALL_DOCKER_IMAGES`; `profiles.py` `PROFILES` ↔ `profiles/*.conf`;
 `advisor_utils.py` `TOOL_ALIASES` targets ↔ `tools_config.json` tool names.
@@ -364,7 +366,7 @@ skills route through: `finding-triage` (finding → disposition), `security-comm
 
 ## Important Patterns
 
-- All scripts use `set -uo pipefail` (not `-e` — individual tool failures don't abort)
+- Installer and lifecycle scripts use `set -uo pipefail` (not `-e` — individual tool failures don't abort)
 - Empty arrays guarded with `[[ ${#arr[@]} -gt 0 ]]` before expansion (bash `set -u`)
 - Version tracking: `.versions` file with `tool|method|version|timestamp` format
 - Non-system binaries end up in `/usr/local/bin` (Linux) or `$PREFIX/bin` (Termux)

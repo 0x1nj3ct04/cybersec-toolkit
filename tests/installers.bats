@@ -1019,6 +1019,40 @@ _run_c2_aggregation() {
     assert_failure
 }
 
+@test "uninstall helpers report a survivor with status 2" {
+    source_libs --installers debian apt
+    snap_available() { return 0; }
+    snap() { [[ "$1" == list ]]; }
+    docker() { [[ "$1" != rmi ]]; }
+    command_exists() { [[ "$1" == docker ]]; }
+
+    run remove_snap_tool zaproxy
+    assert_failure 2
+    run remove_docker_tool SpiderFoot
+    assert_failure 2
+}
+
+@test "remove_binary_release removes a dedicated release dir but keeps a shared one" {
+    source_libs --installers debian apt
+    make_test_tmpdir
+    export PIPX_BIN_DIR="$TEST_TMPDIR/bin" VERSION_FILE="$TEST_TMPDIR/.versions"
+    mkdir -p "$PIPX_BIN_DIR" "$TEST_TMPDIR/own" "$TEST_TMPDIR/shared"
+    BINARY_RELEASES_FIXTURE=(
+        "o/own|owntool|x|$TEST_TMPDIR/own"
+        "o/a|jar-a|x|$TEST_TMPDIR/shared"
+        "o/b|jar-b|x|$TEST_TMPDIR/shared"
+    )
+    touch "$PIPX_BIN_DIR/owntool" "$PIPX_BIN_DIR/jar-a"
+    printf 'jar-b|binary|v1|2026-01-01 00:00:00\n' > "$VERSION_FILE"
+
+    run remove_binary_release owntool
+    assert_success
+    [[ ! -e "$TEST_TMPDIR/own" && ! -e "$PIPX_BIN_DIR/owntool" ]]
+    run remove_binary_release jar-a
+    assert_success
+    [[ -d "$TEST_TMPDIR/shared" && ! -e "$PIPX_BIN_DIR/jar-a" ]]
+}
+
 @test "remove_special_tool removes the patator venv and its symlink" {
     source_libs --installers debian apt
     make_test_tmpdir
@@ -1101,6 +1135,36 @@ _run_c2_aggregation() {
     grep -q "^ourtool|git|existing|" "$_SESSION_FILE"
     ! grep -q "^ourtool|git|installed|" "$_SESSION_FILE" || false
     grep -q "^ourtool|git|HEAD|" "$VERSION_FILE"
+}
+
+@test "docker_pull records an image the host already had as existing" {
+    source_libs --installers debian apt
+    make_test_tmpdir
+    export VERSION_FILE="$TEST_TMPDIR/.versions"
+    export _SESSION_FILE="$TEST_TMPDIR/manifest"
+    : > "$_SESSION_FILE"
+    docker() { return 0; }
+    command_exists() { [[ "$1" == docker ]]; }
+
+    docker_pull "example/present:latest" "PresentTool"
+
+    grep -q "^PresentTool|docker|existing|" "$VERSION_FILE"
+    ! grep -q "^PresentTool|docker|installed|" "$_SESSION_FILE" || false
+}
+
+@test "docker_pull records a newly pulled image as installed" {
+    source_libs --installers debian apt
+    make_test_tmpdir
+    export VERSION_FILE="$TEST_TMPDIR/.versions"
+    export _SESSION_FILE="$TEST_TMPDIR/manifest"
+    : > "$_SESSION_FILE"
+    docker() { [[ "$1" != image ]]; }
+    command_exists() { [[ "$1" == docker ]]; }
+
+    docker_pull "example/new:latest" "NewTool"
+
+    grep -q "^NewTool|docker|example/new:latest|" "$VERSION_FILE"
+    grep -q "^NewTool|docker|installed|" "$_SESSION_FILE"
 }
 
 @test "source rerun stays out of the new rollback session" {
